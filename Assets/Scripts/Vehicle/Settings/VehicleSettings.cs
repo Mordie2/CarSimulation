@@ -57,6 +57,11 @@ namespace Vehicle
         public float predictedDownshiftMargin = 1.15f;
         public float reverseTorqueMultiplier = 1.35f;
 
+        // Rough idle/jitter settings
+        public bool roughIdle = true;
+        public float idleJitterAmplitude = 80f;
+        public float idleJitterSpeed = 2f;
+
 
         [Header("Suspension/Aero")]
         public float frontAntiRoll = 16500f;
@@ -70,7 +75,7 @@ namespace Vehicle
         public float dpadRepeatDelay = 0.25f;
 
         [Header("FX / VFX thresholds")]
-        public float smokeSlipThreshold = 0.45f;   // tweak to taste (0.35–0.6 typical)
+        public float smokeSlipThreshold = 0.45f;   // tweak to taste (0.35â€“0.6 typical)
 
 
         public static VehicleSettings DefaultRuntimeCopy()

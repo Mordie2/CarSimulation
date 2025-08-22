@@ -22,7 +22,7 @@ namespace Vehicle
         private const string EngineParamName = "EngineRPM";
         private const string ThrottleParamName = "Throttle";
 
-        [SerializeField, Range(0.01f, 0.3f)] private float rpmParamSmoothing = 0.06f;
+        [SerializeField, Range(0.01f, 0.3f)] private float rpmParamSmoothing = 0.02f;
         [SerializeField, Range(0.01f, 0.5f)] private float windParamSmoothing = 0.08f;
         private float windStartAtKmh = 15f;
         private float windFullAtKmh = 160f;
