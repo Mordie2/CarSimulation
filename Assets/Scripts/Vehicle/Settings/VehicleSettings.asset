@@ -1,0 +1,114 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: d78976fec307dff4ca2a96d74209f791, type: 3}
+  m_Name: VehicleSettings
+  m_EditorClassIdentifier: 
+  maxSteerAngle: 35
+  steerAtSpeedKmh: 140
+  minSteerScaleLow: 1
+  minSteerScaleHigh: 0.3
+  steerRateDegPerSecLow: 420
+  steerRateDegPerSecHigh: 220
+  steerSmoothing: 0.08
+  steerInputLag: 0.1
+  steerInputFollow: 0.12
+  yawDampAt0Kmh: 0
+  yawDampAt120Kmh: 0.25
+  brakeForce: 5000
+  handbrakeForce: 7000
+  absEnabledDefault: 0
+  absThreshold: 0.1
+  absReleaseTime: 0.1
+  absToggleKey: 98
+  automatic: 1
+  idleRPM: 1100
+  maxRPM: 7500
+  revLimiterRPM: 7200
+  engineInertia: 0.17
+  shiftUpRPM: 6800
+  shiftDownRPM: 4000
+  shiftTime: 0.35
+  engineBrakeTorque: 150
+  torqueCurve:
+    serializedVersion: 2
+    m_Curve:
+    - serializedVersion: 3
+      time: 800
+      value: 100
+      inSlope: 0
+      outSlope: 0
+      tangentMode: 0
+      weightedMode: 0
+      inWeight: 0
+      outWeight: 0
+    - serializedVersion: 3
+      time: 2500
+      value: 240
+      inSlope: 0
+      outSlope: 0
+      tangentMode: 0
+      weightedMode: 0
+      inWeight: 0
+      outWeight: 0
+    - serializedVersion: 3
+      time: 4000
+      value: 300
+      inSlope: 0
+      outSlope: 0
+      tangentMode: 0
+      weightedMode: 0
+      inWeight: 0
+      outWeight: 0
+    - serializedVersion: 3
+      time: 6000
+      value: 340
+      inSlope: 0
+      outSlope: 0
+      tangentMode: 0
+      weightedMode: 0
+      inWeight: 0
+      outWeight: 0
+    - serializedVersion: 3
+      time: 7200
+      value: 300
+      inSlope: 0
+      outSlope: 0
+      tangentMode: 0
+      weightedMode: 0
+      inWeight: 0
+      outWeight: 0
+    m_PreInfinity: 2
+    m_PostInfinity: 2
+    m_RotationOrder: 4
+  drivetrainEfficiency: 0.9
+  torqueMultiplier: 1.44
+  minLaunchRPM: 2000
+  finalDrive: 6.59
+  gearRatios:
+  - -4.78
+  - 0
+  - 3.8
+  - 2.2
+  - 1.55
+  - 1.2
+  - 0.98
+  upshiftSlipBlock: 0.25
+  minShiftInterval: 0.35
+  predictedDownshiftMargin: 1.15
+  reverseTorqueMultiplier: 1.54
+  frontAntiRoll: 16500
+  rearAntiRoll: 13000
+  downforceCoef: 25
+  dpadYAxisName: DPadY
+  dpadPressThreshold: 0.6
+  dpadRepeatDelay: 0.25
+  smokeSlipThreshold: 0.94
