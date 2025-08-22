@@ -105,6 +105,9 @@ MonoBehaviour:
   minShiftInterval: 0.35
   predictedDownshiftMargin: 1.15
   reverseTorqueMultiplier: 1.54
+  roughIdle: 1
+  idleJitterAmplitude: 80
+  idleJitterSpeed: 2
   frontAntiRoll: 16500
   rearAntiRoll: 13000
   downforceCoef: 25

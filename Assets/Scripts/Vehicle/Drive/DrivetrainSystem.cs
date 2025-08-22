@@ -6,8 +6,9 @@ namespace Vehicle
     public class DrivetrainSystem
     {
         private readonly VehicleContext _ctx;
-        private int _gearIndex = 2; // start in N 
+        private int _gearIndex = 2; // start in N
         private float _engineRPM = 1000f;
+        private float _idleNoiseOffset = 0f;
         private float _clutch = 1f;
         private bool _isShifting = false;
         private float _shiftTimer = 0f;
@@ -123,6 +124,7 @@ namespace Vehicle
             float wheelRPM = wheelRPS * 60f;
             float ratioAbs0 = Mathf.Abs(GetCurrentRatio() * _ctx.settings.finalDrive);
             _gearOmegaLP = Mathf.Max(wheelRPM * TWO_PI / 60f * ratioAbs0, 0f);
+            _idleNoiseOffset = Random.value * 100f;
         }
 
         private bool DetectBurnout(IInputProvider input)
@@ -561,7 +563,14 @@ namespace Vehicle
                     _engineRPM = Mathf.MoveTowards(_engineRPM, targetRPMNormal, Time.fixedDeltaTime * 8000f);
             }
 
-            
+            if (_ctx.settings.roughIdle && !pedalDown && _gearIndex <= 2)
+            {
+                float noise = Mathf.PerlinNoise(Time.time * _ctx.settings.idleJitterSpeed, _idleNoiseOffset);
+                float centered = (noise - 0.5f) * 2f;
+                _engineRPM += centered * _ctx.settings.idleJitterAmplitude;
+                _engineRPM = Mathf.Clamp(_engineRPM, _ctx.settings.idleRPM * 0.8f, _ctx.settings.revLimiterRPM + 200f);
+            }
+
             float engineTorqueNormal = 0f;
             if (pedalDown && !cutWindowActive && !liftCutActive)
             {
