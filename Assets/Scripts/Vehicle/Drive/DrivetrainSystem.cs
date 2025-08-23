@@ -1,569 +1,924 @@
-﻿// ============================================= // Role: Engine + Transmission + Auto shift // ============================================= 
+﻿// =============================================
+// File: Scripts/Vehicle/Drive/DrivetrainSystem.cs
+// Role: Engine/flywheel, limiter/idle, torque & coast → wheels
+// Note: Calls ShiftSystem.Tick() first each physics frame.
+// =============================================
 using UnityEngine;
+using System.Collections.Generic;
 
 namespace Vehicle
 {
     public class DrivetrainSystem
     {
+        // ===== Debug =====
+        [System.Serializable]
+        public struct DebugState
+        {
+            public float time;
+
+            // Inputs / controls
+            public float throttle01;
+            public float clutch01;
+            public bool pedalDown;
+            public bool burnoutMode;
+
+            // Gearing / speeds
+            public int gearIndex;
+            public string gearLabel;
+            public float ratio;
+            public float ratioAbs;
+            public float wheelRPM;
+            public float engineRPM;
+            public float engOmega;
+            public float gearOmegaLP;
+            public float gearOmegaRaw;
+
+            // State flags
+            public bool isShifting;
+            public bool lastShiftWasUpshift;
+            public float shiftTimer;
+            public float lastShiftTime;
+            public bool launchActive;
+            public bool instantActive;
+            public bool torqueCutActive;
+            public bool liftCutActive;
+            public bool limiterActive;
+            public float limiterT;
+            public bool hardCutActive;
+
+            public bool coupledNow;
+            public bool coastCoupled;
+            public bool flywheelBlend;
+            public bool runTwoMass;
+
+            // Torques (engine side → wheels)
+            public float T_req;
+            public float T_drag;
+            public float inertiaNm;              // I * dω/dt
+            public float T_toGear_engineSide;    // after caps
+            public float axleTorque;             // at axle (+fwd, -coast)
+            public float perWheelMotorNm;        // avg RL/RR motor
+            public float perWheelBrakeNm;        // avg RL/RR brake
+            public float engineBrakeWheelNm;     // closed-throttle EB (per axle)
+
+            public float T_engineBrake_eng;   // injected on engine side (Nm)
+            public float T_engineBrake_axle;  // the same torque after ratio*FD*eff (Nm at axle)
+
+            // Settings echo (for sanity)
+            public float engineBrakeSetting;
+            public float engineInertiaSetting;
+
+            // Kinematic sanity
+            public float vehSpeedKmh;
+            public float mechSpeedKmh;
+            public float kmhMismatch;
+        }
+
+        public DebugState DebugInfo { get; private set; }
+        public static readonly List<DrivetrainSystem> Instances = new List<DrivetrainSystem>();
+        // ===== /Debug =====
+
         private readonly VehicleContext _ctx;
-        private int _gearIndex = 2; // start in N
+        private readonly ShiftSystem _shift;
+
+
+        // Engine state
         private float _engineRPM = 1000f;
         private float _idleNoiseOffset = 0f;
-        private float _clutch = 1f;
-        private bool _isShifting = false;
-        private float _shiftTimer = 0f;
-        private float _lastShiftTime = -999f;
 
         public float EngineRPM => _engineRPM;
-        public string GearLabel => (_gearIndex == 0) ? "R" : (_gearIndex == 1) ? "N" : (_gearIndex - 1).ToString();
-        public bool IsInReverse => _gearIndex == 0;
-        public int GearIndex => _gearIndex;
-        public event System.Action<int, int> OnGearChanged;
 
-        private bool _isBurnout;
-        public bool IsBurnout => _isBurnout;
-
-        private bool _lastShiftWasUpshift = false;
-        private float _postShiftFadeUntil = -999f;
-        private int _postShiftFromGear = -1;
-        private const float POST_SHIFT_FADE_12 = 0.22f; 
-
-        enum DriveDir { Forward, Reverse }
-        DriveDir _dir = DriveDir.Forward;
-
-        // Tunable intent + hysteresis (small noise won’t flip it) 
-        const float PRESS_INTENT = 0.20f; // pedal press threshold 
-        const float RELEASE_INTENT = 0.10f; // release threshold (lower than press) 
-
-        // --- torque cut around shifts (race-style) --- 
-        private float _torqueCutUntil = -999f;
-        // extra cut window after a lift (even without a shift) 
-        private float _liftCutUntil = -999f;
-
-        // tunables 
-        private const float CUT_AFTER_SHIFT = 0.30f; // extra cut after shift ends (s) 
-        private const float CUT_PEDAL_THRESH = 0.10f; // treat as "no pedal" below this 
-        private const float POST_SHIFT_COAST = 1.5f; // engine-brake boost right after shift 
-        private const float LIFT_CUT_TAIL = 0.20f; // keep torque cut this long after a lift 
-        private const float POS_TORQUE_REARM = 0.12f; // s after shift end 
-        private const float CLUTCH_POS_ENABLE = 0.98f; // clutch almost closed 
-        private const float EMERGENCY_RPM = 7400f; // force upshift here 
-
-        // Launch control state 
-        private enum LaunchState { Idle, Armed, Active, Cooldown }
-        private LaunchState _launchState = LaunchState.Idle;
-        private float _launchStartTime = -999f;
-        private float _launchCooldownUntil = -999f;
-
-        // Launchcontrol Tunables 
-        private const float LAUNCH_ARM_SPEED = 0.4f; // m/s 
-        private const float LAUNCH_ARM_THROTTLE = 0.60f;
-        private const float LAUNCH_EXIT_SPEED = 3.0f; // m/s 
-        private const float LAUNCH_EXIT_THR = 0.20f;
-        private const float LAUNCH_MAX_DURATION = 1.5f; // s 
-        private const float LAUNCH_COOLDOWN = 1.0f; // s 
-        private const float LAUNCH_DISABLE_SPEED = 10f / 3.6f; // 10 km/h in m/s (~2.7778) 
-
-        // --- minimal flywheel model (two-mass during/after shifts) --- 
-        private float _engOmega = 0f; // rad/s (engine/flywheel) 
+        // Flywheel (2-mass style window)
+        private float _engOmega = 0f;       // rad/s
+        private float _gearOmegaLP = 0f;    // rad/s (LP of wheel-side)
         private const float TWO_PI = 6.2831853f;
-        private const float FLYWHEEL_BLEND = 0.25f; // seconds after a shift to keep model active 
+        private const float GEAR_OMEGA_TAU = 0.16f;
+        private const float FLYWHEEL_BLEND = 0.01f; // seconds after a shift to keep model active
         private float _TclutchPrev = 0f;
-        private const float TCLUTCH_SLEW = 8000f; // Nm/s (5k–12k reasonable) 
+        private const float TCLUTCH_SLEW = 4000f; // Nm/s
 
-        // Clutch Tunables
-        private const float CLUTCH_CAP_NM = 1000f; // max clutch torque capacity (Nm) at full engagement 
-        private const float CLUTCH_VISCOUS = 3.5f; // viscous term (Nm per rad/s of slip) 
-        private const float ENGINE_DRAG_IDLE = 20f; // pumping/friction Nm near idle 
-        private const float ENGINE_DRAG_COEF = 0.020f; // extra Nm per rad/s (linear approx) 
-        private const float SHIFT_CLUTCH_SCALE = 0.25f; // reduce clutch capacity during shift (slip feel) 
+        // Clutch/drag tunables (used in flywheel window)
+        private const float CLUTCH_CAP_NM = 12000f;
+        private const float CLUTCH_VISCOUS = 3f;
+        private const float ENGINE_DRAG_IDLE = 20f;
+        private const float ENGINE_DRAG_COEF = 0.10f;
+        private const float SHIFT_CLUTCH_SCALE = 0.25f;  // reduced capacity during active shift
+        private const float SLIP_DEADZONE = 4f;          // rad/s
+        private const float POST_WINDOW_SCALE = 0.90f;   // soften capacity just after shift
+        private const float CLUTCH_POS_ENABLE = 0.98f;   // nearly closed
+        private const float POS_TORQUE_REARM = 0.04f;    // s after shift end
+        private const float POS_TORQUE_THR = 0.25f;      // require real pedal
+        private const float SYNC_RPM_RATE = 120000f; // rpm per second when clutch is (nearly) closed
+        private const float RIGID_COUPLE_THR = 0.995f;    // one source of truth
+        private const float SLIP_LOCK_EPS = 45f;          // rad/s -> snap when nearly synced
+        private const float COAST_CLUTCH_THR = 0.95f; // apply engine brake from here up
 
-        // --- Clutch anti-hunt / debounce --- 
-        private float _upCondTimer = 0f;
-        private float _downCondTimer = 0f;
-        private float _gearDwellUntil = -999f; // no auto-shifts during dwell 
-        private const float COND_HOLD_TIME = 0.25f; // s the condition must persist 
-        private const float GEAR_DWELL_TIME = 0.60f; // s after *any* shift 
-
-        // kickdown / demand thresholds 
-        private const float DOWNSHIFT_DEMAND_THR = 0.35f; // need this much pedal to downshift 
-        private const float CRUISE_NO_SHIFT_THR = 0.08f; // if pedal under this, don't auto change 
-        private const float SLIP_DEADZONE = 6f; // rad/s (~57 rpm) – ignore tiny slip 
-        private const float POST_WINDOW_SCALE = 0.55f; // soften clutch cap during the blend window 
-        private const float POS_TORQUE_THR = 0.25f; // require real pedal to allow positive wheel drive 
+        // --- Creep / bite-in at standstill (first gear) ---
+        private const float CREEP_MAX_CAP_NM = 800f;   // engine-side torque allowed while slipping
+        private const float CREEP_RAMP_S = 0.20f;  // seconds to reach full creep cap
+        private const float CREEP_THR_THROTTLE = 0.03f;  // tiny pedal is enough to start bite-in
+        private float _creepBlend = 0f;                    // 0..1 ramp for bite-in
 
 
+        // add near the other tunables
+        private const float COUPLED_CAP_NM = 8000f;      // engine-side cap when rigid-coupled
+        private const float STOP_SPEED_EPS = 0.20f;      // m/s
+        private const float STOP_WHEEL_RPM_EPS = 5f;     // rpm
 
-        // gear side smoothing 
-        private float _gearOmegaLP = 0f;
-        private const float GEAR_OMEGA_TAU = 0.16f; // s (0.05–0.10 good) 
+        // Low-speed coast behaviour
+        private const float IDLE_HANG_SPEED = 5f;        // m/s (~4.3 km/h): below this, don't hard-couple on lift
+        private const float COAST_EB_RETURN_SPEED = 2.5f;  // m/s (~9 km/h): above this, full engine-brake returns
+                                                           // Idle-bite / creep even with zero throttle (1st gear, near standstill)
+        private const float IDLE_ASSIST_FRAC = 0.18f;    // % of idle torque to feed
+        private const float IDLE_ASSIST_MAX_NM = 220f;   // engine-side clamp
+        private const float IDLE_ASSIST_SPEED_MAX = 1.4f;// m/s (~5 km/h) fade out by here
+        private const float IDLE_ASSIST_RAMP_S = 0.30f;  // ramp time
+        private float _idleAssistBlend = 0f;             // 0..1
+        private const float LAUNCH_SLIP_SPEED = 1.0f; // m/s (~18 km/h) - slip until roughly here
+
+
+        // Limiter shaping
+        private const float LIMITER_BAND_RPM = 350f;
+        private const float LIMITER_NEG_TORQUE_NM = 140f;
+        private const float LIMITER_EXTRA_DRAG_MULT = 3.0f;
+        private const float LIMITER_DECEL_MULT = 12f;
+
+        // Neutral/free-rev feel
+        private const float NEUTRAL_UP_MULT = 1.15f;
+        private const float NEUTRAL_DOWN_MULT = 2.5f;
+        private const float NEUTRAL_PULLDOWN_RPM_PER_S = 3000f;
+
+        private const float ANTI_HANG_DELTA_RPM = 100f;      // how far above target before we intervene
+        private const float LIFT_DECEL_RPM_PER_S = 60000f;    // extra fall rate on big surplus
+
+        private const float GEAR_LOCK_MARGIN_RPM = 100f;          // small headroom to avoid jitter
+        private const float CLOSED_THROTTLE_DECEL_RPM_PER_S = 40000f; // how fast we yank it down on lift
+
+        private const float POWER_TAPER_START_RPM = 7000f; // where torque starts falling fast
+        private const float POWER_TAPER_END_OFFSET = 100f; // taper ends ~this below limiter
+
+        // --- Hard cut limiter ---
+        private const float HARD_CUT_RPM = 7400f;
+        private const float HARD_CUT_HYSTERESIS = 150f;    // release around 7250
+        private const float HARD_CUT_NEG_TORQUE_NM = 500f; // extra negative torque to pull down fast
+        private bool _hardCutActive = false;
+        private const float HARD_CUT_COAST_MULT = 4f; // 2–4 is sane
+
+        // Hard cut behaviour
+        private const float HARD_CUT_PULSE_S = 0.10f;          // 100 ms cut pulse
+        private const float HARD_CUT_RPM_CAP_MARGIN = 10f;     // cap to a hair below setpoint while cutting
+        private float _hardCutTimer = 0f;
+
+        // --- Input hygiene / reverse gating ---
+        private const float INPUT_DEADZONE = 0.05f; // ignore tiny noise
+        private const float SPAWN_INPUT_GRACE_S = 0.35f; // ignore inputs briefly after spawn
+
+        // Reverse requires a deliberate LT press (prevents spawn flicker)
+        private const float REV_ENGAGE_THR = 0.20f; // must exceed to consider "pressing LT"
+        private const float REV_RELEASE_THR = 0.10f; // hysteresis to drop the gate
+        private const float REV_ENGAGE_HOLD_S = 0.06f; // hold LT this long to arm reverse input
+
+        private const float EB_FIRST_SCALE = 0.60f; // 1st gear EB strength
+        private const float EB_AXLE_MAX_NM = 1800f; // per-axle cap for EB (tune)
+
+
+        private float _spawnTime;
+        private float _revGateTimer = 0f;
+        private bool _revGateArmed = false;
+
+        // --- Start-in-Neutral ---
+        private const bool START_IN_NEUTRAL = true;  // set false to go back to current behavior
+        private const float START_NEUTRAL_HOLD_S = 0.60f; // how long we keep it in Neutral after spawn
+
+
+
+
+        private const float REVERSE_GUARD_SPEED = 2.0f; // m/s: treat as "rolling backwards" above this
+
+
+
+        public bool UsingReverseThrottleThisFrame { get; private set; }
+
+
+
+        // Post-shift coast assist
+        private const float POST_SHIFT_COAST = 0.25f;
+
+        // Expose shift info as pass-through for old subscribers
+        public event System.Action<int, int> OnGearChanged
+        {
+            add { _shift.OnGearChanged += value; }
+            remove { _shift.OnGearChanged -= value; }
+        }
+        public string GearLabel => _shift.GearLabel;
+        public bool IsInReverse => _shift.IsInReverse;
+        public int GearIndex => _shift.GearIndex;
+
+        public bool LaunchControlEnabled { get => _shift.LaunchControlEnabled; set => _shift.LaunchControlEnabled = value; }
+        public bool LaunchInstantTorque { get => _shift.LaunchInstantTorque; set => _shift.LaunchInstantTorque = value; }
+        public void ToggleLaunchControl() => _shift.ToggleLaunchControl();
+        public void ToggleLaunchModeInstant() => _shift.ToggleLaunchModeInstant();
+        public void RequestShiftUp() => _shift.RequestShiftUp();
+        public void RequestShiftDown() => _shift.RequestShiftDown();
 
         public DrivetrainSystem(VehicleContext ctx)
         {
             _ctx = ctx;
-            _dir = (_gearIndex == 0) ? DriveDir.Reverse : DriveDir.Forward;
+            _shift = new ShiftSystem(ctx);
 
-            // --- Ensure there is a sane, negative reverse ratio --- 
-            if (_ctx.settings.gearRatios == null || _ctx.settings.gearRatios.Length < 2)
-            {
-                _ctx.settings.gearRatios = new float[] { -3.20f, 0f, 3.20f, 2.20f, 1.55f, 1.20f, 0.98f };
-                Debug.LogWarning("[Drive] gearRatios missing; using safe defaults.");
-            }
-            if (Mathf.Abs(_ctx.settings.gearRatios[0]) < 0.01f || _ctx.settings.gearRatios[0] > 0f)
-            {
-                Debug.LogWarning($"[Drive] Reverse ratio invalid ({_ctx.settings.gearRatios[0]}). Forcing -3.20.");
-                _ctx.settings.gearRatios[0] = -3.20f;
-            }
-
-            // Seed flywheel from current engine RPM (ensure >= idle) 
+            // Seed engine RPM / omega
             _engineRPM = Mathf.Max(_engineRPM, _ctx.settings.idleRPM);
             _engOmega = _engineRPM * TWO_PI / 60f;
 
             float r = _ctx.RL.radius;
             float wheelRPS = _ctx.rb.velocity.magnitude / (2f * Mathf.PI * r);
             float wheelRPM = wheelRPS * 60f;
-            float ratioAbs0 = Mathf.Abs(GetCurrentRatio() * _ctx.settings.finalDrive);
+            float ratioAbs0 = Mathf.Abs(_shift.GetCurrentRatio() * _ctx.settings.finalDrive);
             _gearOmegaLP = Mathf.Max(wheelRPM * TWO_PI / 60f * ratioAbs0, 0f);
             _idleNoiseOffset = Random.value * 100f;
+
+            Instances.Add(this);
+
+            _spawnTime = Time.time;
+
+
         }
 
-        private bool DetectBurnout(IInputProvider input)
+        private float GetWheelRPMFromGround()
         {
-            // Gas + brake held, car basically stopped 
-            return (input.Throttle > 0.9f && input.Brake > 0.9f && _ctx.rb.velocity.magnitude < 3f);
+            float r = _ctx.RL.radius;
+            float wheelRPS = _ctx.rb.velocity.magnitude / (2f * Mathf.PI * r);
+            return wheelRPS * 60f;
         }
 
-        public void TickShifting(IInputProvider input, float speedMs, bool burnoutMode)
+        private float LimiterBlend(float rpm)
         {
-            float throttle01 = (_gearIndex == 0) ? Mathf.Clamp01(input.Brake) : Mathf.Clamp01(input.Throttle);
-            bool demand = throttle01 > CUT_PEDAL_THRESH; // only upshift when driver asks for power 
-
-            // Burnout: lock to 1st, freeze any shift timing 
-            if (burnoutMode)
-            {
-                _dir = DriveDir.Forward;
-                if (_gearIndex <= 1) _gearIndex = 2;
-                _isShifting = false;
-                _shiftTimer = 0f;
-                return;
-            }
-
-            bool stopped = speedMs < 1.2f;
-
-            // Latch desired direction only when stopped 
-            if (stopped)
-            {
-                if (input.Brake > PRESS_INTENT) _dir = DriveDir.Reverse;
-                if (input.Throttle > PRESS_INTENT) _dir = DriveDir.Forward;
-
-                // hysteresis 
-                if (_dir == DriveDir.Reverse && input.Brake < RELEASE_INTENT && input.Throttle > PRESS_INTENT) _dir = DriveDir.Forward;
-                if (_dir == DriveDir.Forward && input.Throttle < RELEASE_INTENT && input.Brake > PRESS_INTENT) _dir = DriveDir.Reverse;
-            }
-
-            // Apply latched direction when stopped 
-            if (stopped)
-            {
-                if (_dir == DriveDir.Reverse && _gearIndex != 0)
-                {
-                    SetReverseInstant();
-                    return;
-                }
-                if (_dir == DriveDir.Forward && _gearIndex < 2)
-                {
-                    StartShift(2);
-                    return;
-                }
-            }
-
-            // Manual bumpers (optional) 
-            if (input.RequestShiftUp) ShiftUp();
-            if (input.RequestShiftDown) ShiftDown();
-
-            // --- Auto up/downshift while moving (anti-hunt) --- 
-            if (_ctx.settings.automatic && _gearIndex >= 2 && !_isShifting)
-            {
-                // No decisions during dwell or right after a shift 
-                if (Time.time >= _gearDwellUntil && (Time.time - _lastShiftTime) > _ctx.settings.minShiftInterval)
-                {
-                    float speedWheelRPM = GetWheelRPMFromGround();
-                    int last = _ctx.settings.gearRatios.Length - 1;
-
-                    // If driver is basically cruising/lifted, hold gear (prevents hunting on tiny pedal) 
-                    bool allowAnyShift = (Mathf.Max(input.Throttle, input.Brake) > CRUISE_NO_SHIFT_THR);
-
-                    float currRatioAbs = Mathf.Abs(_ctx.settings.gearRatios[_gearIndex] * _ctx.settings.finalDrive);
-                    float mechRPM = speedWheelRPM * currRatioAbs;
-
-                    // Hysteresis: use already-existing settings + margins 
-                    float upOn = Mathf.Min(_ctx.settings.shiftUpRPM, _ctx.settings.revLimiterRPM - 200f);
-                    float downOn = _ctx.settings.shiftDownRPM;
-
-                    // ---- UPSHIFT (needs demand + sustained high RPM) ---- 
-                    bool canUpshift = allowAnyShift && (_gearIndex < last) && (throttle01 >= 0.5f);
-                    
-
-                    if (canUpshift)
-                    {
-                        float nextRatioAbs = Mathf.Abs(_ctx.settings.gearRatios[_gearIndex + 1] * _ctx.settings.finalDrive);
-                        float nextRPMPred = speedWheelRPM * nextRatioAbs;
-
-                        // only upshift if predicted next gear keeps us above a safe band 
-                        bool nextOK = nextRPMPred > _ctx.settings.shiftDownRPM * _ctx.settings.predictedDownshiftMargin;
-                        bool upCond = (mechRPM >= upOn) && nextOK && (throttle01 >= 0.5f);
-
-                        _upCondTimer = upCond ? _upCondTimer + Time.fixedDeltaTime : 0f;
-                        if (_upCondTimer >= COND_HOLD_TIME)
-                        {
-                            StartShift(_gearIndex + 1);
-                            _lastShiftTime = Time.time;
-                            _gearDwellUntil = Time.time + GEAR_DWELL_TIME;
-                            _upCondTimer = 0f;
-                            _downCondTimer = 0f;
-                            return; // only one decision per frame 
-                        }
-                    }
-                    else _upCondTimer = 0f;
-
-                    // ---- DOWNSHIFT (needs real demand OR lugging + sustained low RPM) ---- 
-                    bool canDownshift = (_gearIndex > 2);
-                    if (canDownshift)
-                    {
-                        // require significant pedal (kickdown) unless we're really lugging 
-                        bool demandDown = (input.Throttle >= DOWNSHIFT_DEMAND_THR);
-                        bool rpmLow = (mechRPM < downOn * 0.98f); // a whisper of hysteresis 
-                        bool downCond = (rpmLow && (demandDown || mechRPM < downOn * 0.85f)); // force if very low 
-
-                        _downCondTimer = downCond ? _downCondTimer + Time.fixedDeltaTime : 0f;
-                        if (_downCondTimer >= COND_HOLD_TIME)
-                        {
-                            StartShift(_gearIndex - 1);
-                            _lastShiftTime = Time.time;
-                            _gearDwellUntil = Time.time + GEAR_DWELL_TIME;
-                            _upCondTimer = 0f;
-                            _downCondTimer = 0f;
-                            return;
-                        }
-                    }
-                    else _downCondTimer = 0f;
-
-                    // From N to 1st when driver actually gives throttle 
-                    if (_gearIndex == 1 && input.Throttle > 0.1f)
-                    {
-                        StartShift(2);
-                        _lastShiftTime = Time.time;
-                        _gearDwellUntil = Time.time + GEAR_DWELL_TIME;
-                        _upCondTimer = 0f;
-                        _downCondTimer = 0f;
-                        return;
-                    }
-                }
-                else
-                {
-                    // During dwell, reset timers so we don't “bank” a decision 
-                    _upCondTimer = 0f;
-                    _downCondTimer = 0f;
-                }
-            }
-
-            // Emergency upshift: protect engine from overrev 
-            if (!_isShifting && _gearIndex >= 2 && _engineRPM >= EMERGENCY_RPM)
-            {
-                int last = _ctx.settings.gearRatios.Length - 1;
-                int target = Mathf.Min(_gearIndex + 1, last);
-                StartShift(target);
-                return;
-            }
-
-            // Shift timing/clutch ONLY – torque is handled in TickPowertrain() 
-            if (_isShifting)
-            {
-                _shiftTimer += Time.fixedDeltaTime;
-                float t = _shiftTimer / _ctx.settings.shiftTime;
-                _clutch = (t < 0.5f) ? Mathf.Lerp(1f, 0f, t * 2f) : Mathf.Lerp(0f, 1f, (t - 0.5f) * 2f);
-
-                if (_shiftTimer >= _ctx.settings.shiftTime)
-                {
-                    _isShifting = false;
-                    if (_postShiftFromGear == 2) // from 1st 
-                        _postShiftFadeUntil = Time.time + POST_SHIFT_FADE_12;
-                    _postShiftFromGear = -1;
-                    _shiftTimer = 0f;
-                    _clutch = 1f;
-                }
-            }
-            else
-            {
-                _clutch = Mathf.MoveTowards(_clutch, 1f, Time.fixedDeltaTime * 5f);
-            }
+            float soft = _ctx.settings.revLimiterRPM - LIMITER_BAND_RPM;
+            return Mathf.Clamp01((rpm - soft) / Mathf.Max(1f, LIMITER_BAND_RPM));
         }
 
-        public void TickPowertrain(IInputProvider input, float speedMs, bool burnoutMode)
+        // Add this property to DrivetrainSystem (near other fields)
+
+
+        // Replace MapThrottle01 with this version
+        private float MapThrottle01(IInputProvider input)
         {
+            // Grace window after spawn: ignore all driving inputs
+            if ((Time.time - _spawnTime) < SPAWN_INPUT_GRACE_S)
+            {
+                UsingReverseThrottleThisFrame = false;
+                return 0f;
+            }
+
+            bool manualMode = !_ctx.settings.automatic;
+            bool inReverse = _shift.IsInReverse;
+
+            float rt = Mathf.Clamp01(input.Throttle);
+            float lt = Mathf.Clamp01(input.Brake);
+
+            // Deadzones
+            rt = (rt <= INPUT_DEADZONE) ? 0f : rt;
+            lt = (lt <= INPUT_DEADZONE) ? 0f : lt;
+
+            UsingReverseThrottleThisFrame = false;
+
+            // --- Manual: realistic (RT always throttle) ---
+            if (manualMode)
+            {
+                _revGateArmed = false;
+                _revGateTimer = 0f;
+                return rt;
+            }
+
+            // --- Auto & not in reverse: arcade forward (RT throttle) ---
+            if (!inReverse)
+            {
+                _revGateArmed = false;
+                _revGateTimer = 0f;
+                return rt;
+            }
+
+            // --- Auto & Reverse: arcade reverse (LT becomes throttle) ---
+            // Gate to avoid accidental reverse-throttle from tiny LT bumps
+            if (lt > REV_ENGAGE_THR)
+            {
+                _revGateTimer += Time.fixedDeltaTime;
+                if (_revGateTimer >= REV_ENGAGE_HOLD_S) _revGateArmed = true;
+            }
+            else if (lt < REV_RELEASE_THR)
+            {
+                _revGateArmed = false;
+                _revGateTimer = 0f;
+            }
+
+            UsingReverseThrottleThisFrame = _revGateArmed && (lt > 0f);
+            return UsingReverseThrottleThisFrame ? lt : 0f; // RT is ignored while in Reverse
+        }
+
+
+
+        // Main physics tick (call from FixedUpdate)
+        public void Tick(IInputProvider input, float speedMs, bool burnoutMode)
+        {
+            // clear per-frame torques
             _ctx.RL.motorTorque = 0f;
             _ctx.RR.motorTorque = 0f;
 
-            // Map pedals to throttle (reverse uses brake as throttle) 
-            float throttle01 = (_gearIndex == 0) ? Mathf.Clamp01(input.Brake) : Mathf.Clamp01(input.Throttle);
+            float throttle01 = MapThrottle01(input);
+            bool onThrottle = throttle01 > 0.05f;
 
-            // latch a short lift-cut tail whenever the pedal is below threshold 
-            if (throttle01 < CUT_PEDAL_THRESH) _liftCutUntil = Time.time + LIFT_CUT_TAIL;
+            // --- Hard-cut pulse latch (allow even off-throttle in 1st so downhill overrun is handled) ---
+            bool overRev = _engineRPM >= HARD_CUT_RPM;
+            bool allowPulse = onThrottle || (_shift.GearIndex == 2); // 1st gear downhill case
+            if (allowPulse && overRev && _hardCutTimer <= 0f) _hardCutTimer = HARD_CUT_PULSE_S;
+            _hardCutTimer = Mathf.Max(0f, _hardCutTimer - Time.fixedDeltaTime);
+            _hardCutActive = _hardCutTimer > 0f;
 
-            bool pedalDown = throttle01 >= CUT_PEDAL_THRESH;
-            bool cutWindowActive = (Time.time < _torqueCutUntil);
-            bool liftCutActive = (Time.time < _liftCutUntil);
+            // --- Shifter/LC/Cut update ---
+            _shift.Tick(input, speedMs, _engineRPM, throttle01, burnoutMode);
 
-            // ----------- Launch Control State Machine (1st gear only) ----------- 
-            bool inFirst = (_gearIndex == 2); // your 1st gear index 
+            // Quick locals from shifter
+            bool isShifting = _shift.IsShifting;
+            float clutch = _shift.Clutch;
+            int gearIndex = _shift.GearIndex;
+            bool inFirst = (gearIndex == 2); // you already have this earlier; keep a single definition
 
-            if (speedMs > LAUNCH_DISABLE_SPEED && _launchState != LaunchState.Idle)
+            float ratio = _shift.GetCurrentRatio();
+            float ratioAbs = Mathf.Abs(ratio * _ctx.settings.finalDrive);
+            float wheelRPM = GetWheelRPMFromGround();
+
+            // Signed vehicle speed along the car's forward axis (+forward, -backward)
+            float longSpeedSigned = Vector3.Dot(_ctx.rb.velocity, _ctx.rb.transform.forward);
+
+            // Direction of selected gear (ratio>0 = forward, ratio<0 = reverse)
+            int gearDir = (ratio >= 0f) ? 1 : -1;
+            // Direction of current motion
+            int motionDir = (longSpeedSigned >= 0f) ? 1 : -1;
+
+            // True when car is rolling opposite to selected gear at meaningful speed
+            bool reverseMotion = (gearDir * motionDir) < 0 && Mathf.Abs(longSpeedSigned) > REVERSE_GUARD_SPEED;
+
+
+            // Dynamic freewheel speed ≈ a bit above "mechanical speed at idle" in 1st
+            float wheelCirc = 2f * Mathf.PI * _ctx.RL.radius;
+            float idleMechSpeedMs = (_ctx.settings.idleRPM / 60f) / Mathf.Max(ratioAbs, 1e-4f) * wheelCirc;
+            // clamp between walking speed and jog
+            float FREEWHEEL_SPEED = Mathf.Clamp(idleMechSpeedMs * 1.25f, 1.0f, 5.0f);
+
+
+            bool manualMode = !_ctx.settings.automatic;
+
+            // Windows that kill positive torque (instant mode can override)
+            bool pedalDown = throttle01 > (INPUT_DEADZONE + 0.01f);
+            bool cutWindowActive = _shift.IsTorqueCutActive;
+            bool liftCutActive = _shift.IsLiftCutActive;
+            bool instantActive = _shift.IsInstantTorqueActive(speedMs, inFirst, throttle01);
+            if (instantActive) { cutWindowActive = false; liftCutActive = false; }
+            bool launchActive = _shift.IsLaunchActive;
+
+            bool launchingSlip = inFirst && pedalDown && (speedMs < LAUNCH_SLIP_SPEED) && (clutch < RIGID_COUPLE_THR);
+
+            // Limiter shaping
+            float limiterT = LimiterBlend(_engineRPM);
+            bool limiterActive = limiterT > 0f;
+
+            // ---- Debug seed ----
+            var dbg = new DebugState
             {
-                _launchState = LaunchState.Cooldown;
-                _launchCooldownUntil = Time.time + LAUNCH_COOLDOWN;
-            }
+                time = Time.time,
+                throttle01 = throttle01,
+                clutch01 = clutch,
+                pedalDown = pedalDown,
+                burnoutMode = burnoutMode,
 
-            switch (_launchState)
-            {
-                case LaunchState.Idle:
-                    if (inFirst && speedMs < LAUNCH_ARM_SPEED && throttle01 > LAUNCH_ARM_THROTTLE && Time.time >= _launchCooldownUntil)
-                        _launchState = LaunchState.Armed;
-                    break;
+                gearIndex = gearIndex,
+                gearLabel = _shift.GearLabel,
+                ratio = ratio,
+                ratioAbs = ratioAbs,
+                wheelRPM = wheelRPM,
 
-                case LaunchState.Armed:
-                    // Go Active as soon as we’re still in 1st and throttle is still committed 
-                    if (!inFirst || throttle01 < LAUNCH_ARM_THROTTLE)
-                        _launchState = LaunchState.Idle;
-                    else
-                    {
-                        _launchState = LaunchState.Active;
-                        _launchStartTime = Time.time;
-                    }
-                    break;
+                engineRPM = _engineRPM,
+                engOmega = _engOmega,
+                gearOmegaLP = _gearOmegaLP,
 
-                case LaunchState.Active:
-                    // Exit conditions: rolling, lift, time cap, or we’ve already sync’d above launch 
-                    if (!inFirst || speedMs > LAUNCH_EXIT_SPEED || throttle01 < LAUNCH_EXIT_THR || (Time.time - _launchStartTime) > LAUNCH_MAX_DURATION)
-                    {
-                        _launchState = LaunchState.Cooldown;
-                        _launchCooldownUntil = Time.time + LAUNCH_COOLDOWN;
-                    }
-                    break;
+                isShifting = isShifting,
+                lastShiftWasUpshift = _shift.LastShiftWasUpshift,
+                shiftTimer = _shift.ShiftTimer,
+                lastShiftTime = _shift.LastShiftTime,
+                launchActive = _shift.IsLaunchActive,
+                instantActive = _shift.IsInstantTorqueActive(speedMs, inFirst, throttle01),
+                torqueCutActive = _shift.IsTorqueCutActive,
+                liftCutActive = _shift.IsLiftCutActive,
 
-                case LaunchState.Cooldown:
-                    if (Time.time >= _launchCooldownUntil)
-                        _launchState = LaunchState.Idle;
-                    break;
-            }
-            // -------------------------------------------------------------------- 
+                limiterActive = limiterActive,
+                limiterT = limiterT,
+                hardCutActive = _hardCutActive,
 
-            // ------------------------ 
-            // Burnout logic (unchanged) 
-            // ------------------------ 
+                engineBrakeSetting = _ctx.settings.engineBrakeTorque,
+                engineInertiaSetting = _ctx.settings.engineInertia,
+
+                vehSpeedKmh = _ctx.rb.velocity.magnitude * 3.6f
+            };
+            // --------------------
+
+
+            // ------------------------
+            // Burnout special case
+            // ------------------------
             if (burnoutMode)
             {
                 float targetRPM = Mathf.Lerp(_ctx.settings.idleRPM, _ctx.settings.maxRPM, throttle01);
                 float follow = Time.fixedDeltaTime / Mathf.Max(0.0001f, _ctx.settings.engineInertia);
                 _engineRPM = Mathf.Clamp(
                     Mathf.Lerp(_engineRPM, targetRPM, Mathf.Clamp01(follow)),
-                    _ctx.settings.idleRPM * 0.8f,
+                    _ctx.settings.idleRPM,
                     _ctx.settings.revLimiterRPM + 200f
                 );
 
                 float engineTorque = _ctx.settings.torqueCurve.Evaluate(_engineRPM) * throttle01 * _ctx.settings.torqueMultiplier;
 
-                // Lock fronts 
-                _ctx.FL.motorTorque = 0f;
-                _ctx.FR.motorTorque = 0f;
-                _ctx.FL.brakeTorque = 1e9f;
-                _ctx.FR.brakeTorque = 1e9f;
+                // Lock fronts for show
+                _ctx.FL.motorTorque = 0f; _ctx.FR.motorTorque = 0f;
+                _ctx.FL.brakeTorque = 1e9f; _ctx.FR.brakeTorque = 1e9f;
 
-                // Drive rears only 
-                float perRear = (engineTorque * GetCurrentRatio() * _ctx.settings.finalDrive * _ctx.settings.drivetrainEfficiency) * 0.5f;
+                float perRear = (engineTorque * ratio * _ctx.settings.finalDrive * _ctx.settings.drivetrainEfficiency) * 0.5f;
                 _ctx.RL.motorTorque = perRear;
                 _ctx.RR.motorTorque = perRear;
-                _ctx.RL.brakeTorque = 0f;
-                _ctx.RR.brakeTorque = 0f;
+                _ctx.RL.brakeTorque = 0f; _ctx.RR.brakeTorque = 0f;
                 return;
             }
-
-            // ------------------------ 
-            // Normal drivetrain logic 
-            // ------------------------ 
-            float ratioAbs = Mathf.Abs(GetCurrentRatio() * _ctx.settings.finalDrive);
-            float speedWheelRPM = GetWheelRPMFromGround();
-            bool inGear = !Mathf.Approximately(GetCurrentRatio(), 0f);
-
-            // If we're in the middle of a shift: free-rev and DO NOT send torque to wheels 
-            if (_isShifting)
+            // --- Start-in-Neutral masking (spawn safety) ---
+            // place this right after the burnout block and BEFORE you branch into neutral/coupled paths
+            if (START_IN_NEUTRAL)
             {
-                // Rev-match the engine to the *new* gear’s wheel-synced RPM 
-                float newRatioAbs = Mathf.Abs(GetCurrentRatio() * _ctx.settings.finalDrive);
+                float sinceSpawn = Time.time - _spawnTime;
+                if (sinceSpawn < START_NEUTRAL_HOLD_S)
+                {
+                    // Nudge visible gear toward Neutral (0=R, 1=N, 2=1st in your setup)
+                    if (_shift.GearIndex < 1) _shift.RequestShiftUp();
+                    else if (_shift.GearIndex > 1) _shift.RequestShiftDown();
+
+                    // Keep RPM near idle with neutral-like inertia
+                    float neutralInertiaUp = Mathf.Max(0.0001f, _ctx.settings.engineInertia * NEUTRAL_UP_MULT);
+                    float neutralAlpha = Mathf.Clamp01(Time.fixedDeltaTime / neutralInertiaUp);
+                    float neutralTargetIdle = _ctx.settings.idleRPM;
+                    _engineRPM = Mathf.Clamp(
+                        Mathf.Lerp(_engineRPM, neutralTargetIdle, neutralAlpha),
+                        _ctx.settings.idleRPM,
+                        _ctx.settings.revLimiterRPM + 200f
+                    );
+
+                    // Absolutely no drive torque while we hold Neutral
+                    _ctx.RL.motorTorque = 0f;
+                    _ctx.RR.motorTorque = 0f;
+
+                    // Debug echo (mask as Neutral for this frame)
+                    dbg.gearIndex = 1;
+                    dbg.gearLabel = "N (spawn)";
+                    dbg.ratio = 0f;
+                    dbg.ratioAbs = 0f;
+                    dbg.engineRPM = _engineRPM;
+                    DebugInfo = dbg;
+
+                    return; // bail out early this frame while in forced Neutral
+                }
+            }
+
+
+
+            // Neutral-like detection
+            bool inGear = !Mathf.Approximately(ratio, 0f);
+            bool lowSpeedCoast = (!pedalDown && speedMs < FREEWHEEL_SPEED);
+
+
+            bool physicallyCoupled =
+                inGear &&
+                (clutch >= RIGID_COUPLE_THR) &&
+                !isShifting &&
+                (wheelRPM > STOP_WHEEL_RPM_EPS) &&
+                !lowSpeedCoast &&
+                !reverseMotion; 
+            bool flywheelBlend = ((Time.time - _shift.LastShiftTime) < FLYWHEEL_BLEND) && !lowSpeedCoast;
+            bool runTwoMass = physicallyCoupled || flywheelBlend;
+
+            bool wantFreewheel =
+    inFirst && (ratio > 0f) && !pedalDown && !input.Handbrake &&
+    (speedMs < FREEWHEEL_SPEED) && (wheelRPM > STOP_WHEEL_RPM_EPS);
+
+            if (wantFreewheel)
+            {
+                // Do NOT treat as coupled, and skip the two-mass path entirely
+                physicallyCoupled = false;
+                flywheelBlend = false;
+                runTwoMass = false;
+            }
+
+            bool neutralLike = !inGear || clutch < 0.2f || gearIndex == 1;
+
+            // ------------------------
+            // Active shift: rev-match, no drive torque
+            // ------------------------
+            if (isShifting)
+            {
+                float newRatioAbs = Mathf.Abs(ratio * _ctx.settings.finalDrive);
                 float syncRPM = Mathf.Clamp(
-                    Mathf.Max(speedWheelRPM * newRatioAbs, _ctx.settings.idleRPM),
-                    _ctx.settings.idleRPM * 0.8f,
+                    Mathf.Max(wheelRPM * newRatioAbs, _ctx.settings.idleRPM),
+                    _ctx.settings.idleRPM,
                     _ctx.settings.revLimiterRPM + 200f
                 );
 
-                // Blend toward syncRPM quickly as the shift progresses 
-                float t = Mathf.Clamp01(_shiftTimer / Mathf.Max(0.0001f, _ctx.settings.shiftTime));
-                // more aggressive snap early to kill mismatch 
-                float snap = Mathf.Lerp(0.25f, 1.0f, t); // start fast, finish exact 
+                float t = Mathf.Clamp01(_shift.ShiftTimer / Mathf.Max(0.0001f, _ctx.settings.shiftTime));
+                float snap = Mathf.Lerp(0.25f, 1.0f, t);
                 float followShift = Time.fixedDeltaTime / Mathf.Max(0.0001f, _ctx.settings.engineInertia * snap);
                 _engineRPM = Mathf.Lerp(_engineRPM, syncRPM, Mathf.Clamp01(followShift));
 
-                // Absolutely no drive torque during the shift 
                 _ctx.RL.motorTorque = 0f;
                 _ctx.RR.motorTorque = 0f;
 
-                // ADD: light engine-brake even while shifting IF it's an upshift and driver is lifted 
-                if (_lastShiftWasUpshift && !pedalDown && !input.Handbrake)
-                {
-                    float tShift = Mathf.Clamp01(_shiftTimer / Mathf.Max(0.0001f, _ctx.settings.shiftTime));
-                    float shiftSnap = Mathf.Lerp(0.25f, 1.0f, tShift);
-                    float ratioAbsDyn = Mathf.Abs(GetCurrentRatio() * _ctx.settings.finalDrive);
-                    float rpmFactor = Mathf.InverseLerp(
-                        _ctx.settings.idleRPM * 0.9f,
-                        _ctx.settings.maxRPM,
-                        Mathf.Clamp(_engineRPM, _ctx.settings.idleRPM * 0.9f, _ctx.settings.maxRPM)
-                    );
-                    float coastNmAtWheel = _ctx.settings.engineBrakeTorque * ratioAbsDyn * _ctx.settings.drivetrainEfficiency * rpmFactor * shiftSnap;
-                    float perWheelCoast = coastNmAtWheel * 0.5f; // RWD split 
-                    _ctx.RL.brakeTorque += perWheelCoast;
-                    _ctx.RR.brakeTorque += perWheelCoast;
-                }
+                // Gentle coast during upshift if lifted
                 return;
             }
 
-            // Not shifting: compute target/mech RPM 
-            float targetRPMNormal = _engineRPM; // fallback to current RPM 
-            if (_clutch > 0.99f && inGear)
+            // ------------------------
+            // Target RPM computation
+            // ------------------------
+            float targetRPMNormal;
+            if (clutch > 0.99f && inGear)
             {
-                float mechRPM = Mathf.Max(speedWheelRPM * ratioAbs, _ctx.settings.idleRPM);
-                if (_launchState == LaunchState.Active && inFirst)
-                {
+                float mechRPM = Mathf.Max(wheelRPM * ratioAbs, _ctx.settings.idleRPM);
+                if ((launchActive && inFirst) || instantActive)
                     mechRPM = Mathf.Max(mechRPM, _ctx.settings.minLaunchRPM);
-                }
                 targetRPMNormal = mechRPM;
             }
             else
             {
-                // free-rev when decoupled 
                 targetRPMNormal = Mathf.Lerp(_ctx.settings.idleRPM, _ctx.settings.maxRPM, throttle01);
             }
 
-            // --- FLYWHEEL WINDOW: use 2-mass integration during shift and ~0.35s after --- 
-            bool flywheelWindow = _isShifting || ((Time.time - _lastShiftTime) < FLYWHEEL_BLEND);
-            if (flywheelWindow)
+            // During a slip launch, don't aim above the launch RPM.
+            // This keeps the engine controller from chasing max RPM while the clutch is managing slip.
+            if (launchingSlip && !isShifting)
+            {
+                targetRPMNormal = Mathf.Min(targetRPMNormal, _ctx.settings.minLaunchRPM);
+            }
+
+
+            // Only cap the control target during hard cut when NOT mechanically coupled
+
+            bool rearmedPosTorque =
+    physicallyCoupled &&
+    (Time.time - _shift.LastShiftTime) >= POS_TORQUE_REARM &&   // e.g. 0.12 s
+    throttle01 >= POS_TORQUE_THR &&                             // e.g. 0.25 pedal
+    !input.Handbrake;
+
+            if (rearmedPosTorque)
+            {
+                cutWindowActive = false;
+                liftCutActive = false;
+            }
+
+            if (_hardCutActive && !physicallyCoupled)
+                targetRPMNormal = Mathf.Min(targetRPMNormal, HARD_CUT_RPM - HARD_CUT_RPM_CAP_MARGIN);
+
+            // ------------------------
+            // Two-mass (engine↔gear) coupling when actually coupled,
+            // OR shortly after shifts (keep your smoothing feel)
+            // ------------------------
+
+            if (runTwoMass)
             {
                 float dt = Time.fixedDeltaTime;
-                float ratioAbsFW = Mathf.Abs(GetCurrentRatio() * _ctx.settings.finalDrive);
-                float gearOmegaRaw = Mathf.Max(speedWheelRPM * TWO_PI / 60f * ratioAbsFW, 0f);
-
-                // 1-pole low-pass for the gear side 
+                float gearOmegaRaw = Mathf.Max(wheelRPM * TWO_PI / 60f * ratioAbs, 0f);
                 float a = 1f - Mathf.Exp(-dt / GEAR_OMEGA_TAU);
                 _gearOmegaLP = Mathf.Lerp(_gearOmegaLP, gearOmegaRaw, a);
-                float gearOmega = _gearOmegaLP;
 
+
+                dbg.flywheelBlend = (Time.time - _shift.LastShiftTime) < FLYWHEEL_BLEND;
+                dbg.runTwoMass = true;
+                dbg.coupledNow = physicallyCoupled;
+                dbg.gearOmegaRaw = gearOmegaRaw;
+
+
+                // --- First-gear creep / bite-in state ---
+                bool almostStopped = (_ctx.rb.velocity.magnitude < STOP_SPEED_EPS) || (wheelRPM < STOP_WHEEL_RPM_EPS);
+                bool creepWanted = inFirst && inGear && !isShifting && almostStopped && (throttle01 > CREEP_THR_THROTTLE) && (ratio > 0f);
+
+                // ramp 0→1 while conditions hold, 1→0 when they stop
+                _creepBlend = Mathf.MoveTowards(_creepBlend, creepWanted ? 1f : 0f,
+                                                Time.fixedDeltaTime / Mathf.Max(0.0001f, CREEP_RAMP_S));
+                float creepCap = CREEP_MAX_CAP_NM * _creepBlend;
+
+
+
+                // capture before any change so omegaDot is always well-defined
+                float prevOmega = _engOmega;
+
+                // Use raw when truly coupled, LP otherwise
+                float targetOmega = physicallyCoupled ? _gearOmegaLP : _engOmega;
+
+                float T_drag = ENGINE_DRAG_IDLE + ENGINE_DRAG_COEF * Mathf.Max(_engOmega, 0f);
+                if (physicallyCoupled)
+                {
+                    float maxDeltaOmega = (SYNC_RPM_RATE * TWO_PI / 60f) * dt;
+                    _engOmega = Mathf.MoveTowards(prevOmega, targetOmega, maxDeltaOmega);
+                    if (Mathf.Abs(_engOmega - gearOmegaRaw) <= SLIP_LOCK_EPS) _engOmega = gearOmegaRaw;
+                }
+
+                // Update RPM
+
+
+                _engineRPM = Mathf.Clamp(_engOmega * 60f / TWO_PI, _ctx.settings.idleRPM, _ctx.settings.revLimiterRPM + 200f);
+
+                // Engine request & drag
+                // --- Engine request & drag (leave as you have) ---
                 float T_req = 0f;
+
+
+                // --- Zero-throttle idle assist in 1st to overcome static friction ---
+                bool permitIdleCreep =
+                    inFirst && inGear && !isShifting && ratio > 0f && !input.Handbrake &&
+                    (speedMs < IDLE_ASSIST_SPEED_MAX) && (throttle01 < 0.02f) && (clutch >= 0.95f);
+
+                // ramp 0→1 while allowed; 1→0 otherwise
+                _idleAssistBlend = Mathf.MoveTowards(
+                    _idleAssistBlend,
+                    permitIdleCreep ? 1f : 0f,
+                    Time.fixedDeltaTime / Mathf.Max(0.0001f, IDLE_ASSIST_RAMP_S)
+                );
+
+                // base on idle torque so engine sound/curve stays coherent
+                float idleBaseNm = _ctx.settings.torqueCurve.Evaluate(Mathf.Max(_ctx.settings.idleRPM, _engineRPM))
+                                   * _ctx.settings.torqueMultiplier;
+
+                // fade assist out as speed rises (no long cruising on idle)
+                float idleAssistSpeedScale = Mathf.Clamp01(Mathf.InverseLerp(IDLE_ASSIST_SPEED_MAX, 0f, speedMs));
+
+                float idleAssistNm = Mathf.Min(IDLE_ASSIST_MAX_NM, idleBaseNm * IDLE_ASSIST_FRAC)
+                                     * _idleAssistBlend * idleAssistSpeedScale;
+
+                // add to engine request (positive torque at 0 throttle)
+                T_req += idleAssistNm;
+
+                float I = Mathf.Max(0.0001f, _ctx.settings.engineInertia);
+                prevOmega = _engOmega;
+
+
+
                 if (pedalDown && !cutWindowActive && !liftCutActive)
                 {
                     T_req = _ctx.settings.torqueCurve.Evaluate(_engineRPM) * throttle01 * _ctx.settings.torqueMultiplier;
-                    T_req *= PostShiftScale();
-                    if (_gearIndex == 0) T_req *= _ctx.settings.reverseTorqueMultiplier;
+                    T_req *= HighRpmFalloff(_engineRPM);
+                    T_req *= _shift.PostShiftTorqueScale;
+                    if (gearIndex == 0) T_req *= _ctx.settings.reverseTorqueMultiplier;
+                    if (limiterActive) T_req *= (1f - limiterT);
                     if (_engineRPM >= _ctx.settings.revLimiterRPM && throttle01 > 0.1f) T_req = 0f;
+                    if (limiterActive) T_req -= LIMITER_NEG_TORQUE_NM * limiterT * (manualMode ? 1f : 0.5f);
                 }
 
-                // Engine internal drag (pumping/friction) 
-                float T_drag = ENGINE_DRAG_IDLE + ENGINE_DRAG_COEF * Mathf.Max(_engOmega, 0f);
 
-                // Clutch coupling (limited, viscous). Reduce capacity during shift for slip feel. 
-                // --- clutch coupling (directional, with deadzone, softened after shift) --- 
-                float clutchEngage = _clutch;
-                // soften capacity both during the shift and for the post-shift blend window 
-                bool postBlend = !_isShifting; // we are in flywheelWindow but not actively shifting 
-                float cap = CLUTCH_CAP_NM * clutchEngage * (_isShifting ? SHIFT_CLUTCH_SCALE : POST_WINDOW_SCALE);
 
-                float slip = _engOmega - gearOmega;
-                // deadzone to stop chatter around sync 
-                float slipEff = Mathf.Abs(slip) < SLIP_DEADZONE ? 0f : (slip - Mathf.Sign(slip) * SLIP_DEADZONE);
 
-                // viscous coupling 
-                float T_clutch_visc = -CLUTCH_VISCOUS * slipEff; // resists slip 
-
-                bool allowPositive = !_isShifting && _clutch >= CLUTCH_POS_ENABLE && (Time.time - _lastShiftTime) >= POS_TORQUE_REARM && throttle01 >= POS_TORQUE_THR && !cutWindowActive && !liftCutActive;
-                float capPos = allowPositive ? cap : 0f;
-                float capNeg = cap; // always allow engine-brake to wheels 
-
-                float T_clutch = Mathf.Clamp(T_clutch_visc, -capNeg, capPos);
-
-                float maxStep = TCLUTCH_SLEW * dt;
-                T_clutch = Mathf.Clamp(T_clutch, _TclutchPrev - maxStep, _TclutchPrev + maxStep);
-                _TclutchPrev = T_clutch;
-
-                // Integrate engine omega using engine inertia 
-                // (your settings.engineInertia is “time constant”-like; 
-                // here we treat it as kg·m² equivalent. If your inertia is too small/large, 
-                // adjust feel with CLUTCH_VISCOUS & caps.) 
-                float I = Mathf.Max(0.0001f, _ctx.settings.engineInertia);
-                float T_net_engine = T_req - T_drag - T_clutch;
-                float domega = (T_net_engine / I) * dt;
-                _engOmega = Mathf.Max(0f, _engOmega + domega);
-
-                // Write back engineRPM from physics 
-                _engineRPM = Mathf.Clamp(_engOmega * 60f / TWO_PI, _ctx.settings.idleRPM * 0.8f, _ctx.settings.revLimiterRPM + 200f);
-
-                // Wheel drive torque contribution from clutch → through gears to axle 
-                // Note: sign is POS to wheels when slip<0 (engine faster than gear), NEG when overrun 
-                float driveTorqueFromClutch = T_clutch * Mathf.Sign(GetCurrentRatio()) * _ctx.settings.finalDrive * _ctx.settings.drivetrainEfficiency;
-
-                // Apply to wheels respecting your existing cut logic (no positive drive if cut/lift) 
-                // Positive drive only when driver asks for it and no cut: 
-                if (pedalDown && !cutWindowActive && !liftCutActive && driveTorqueFromClutch > 0f)
+                float T_engineBrake_eng = 0f;
+                if (physicallyCoupled && !pedalDown && !input.Handbrake)
                 {
-                    float perWheel = (driveTorqueFromClutch * 0.5f); // RWD split 
-                    _ctx.RL.motorTorque = perWheel;
-                    _ctx.RR.motorTorque = perWheel;
-                }
-                else
-                {
-                    _ctx.RL.motorTorque = 0f;
-                    _ctx.RR.motorTorque = 0f;
+                    // Magnitude from RPM & lift
+                    float rpmFactor = Mathf.InverseLerp(
+                        _ctx.settings.idleRPM, _ctx.settings.maxRPM,
+                        Mathf.Clamp(_engineRPM, _ctx.settings.idleRPM, _ctx.settings.maxRPM));
+                    float lift = 1f - throttle01;
+                    float ebMag = _ctx.settings.engineBrakeTorque * rpmFactor * lift;
+
+                    // Speed fade (kill EB near creep, full EB above ~9 km/h)
+                    float ebSpeedScale = Mathf.Clamp01(Mathf.InverseLerp(COAST_EB_RETURN_SPEED, IDLE_HANG_SPEED, speedMs));
+
+                    // Gear scaling (less EB in 1st)
+                    float ratioAbsCurr = Mathf.Abs(ratio * _ctx.settings.finalDrive);
+                    float ratioAbsG1 = Mathf.Abs(_ctx.settings.gearRatios[Mathf.Clamp(2, 0, _ctx.settings.gearRatios.Length - 1)] * _ctx.settings.finalDrive);
+                    float ratioAbsG2 = Mathf.Abs(_ctx.settings.gearRatios[Mathf.Clamp(3, 0, _ctx.settings.gearRatios.Length - 1)] * _ctx.settings.finalDrive);
+                    float g01 = Mathf.Clamp01(Mathf.InverseLerp(ratioAbsG1, ratioAbsG2, ratioAbsCurr));
+                    float ebGearScale = Mathf.Lerp(EB_FIRST_SCALE, 1f, g01);
+
+                    ebMag *= ebSpeedScale * ebGearScale;
+
+                    // SIGN: engine braking must oppose current motion
+                    float ebEngineSign = -Mathf.Sign(longSpeedSigned) * Mathf.Sign(ratio == 0f ? 1f : ratio);
+
+                    // Soften during post-shift cuts
+                    if (_shift.IsTorqueCutActive || _shift.IsLiftCutActive) ebMag *= POST_SHIFT_COAST;
+
+                    // Final engine-side EB torque
+                    T_engineBrake_eng = ebMag * ebEngineSign;
+
+                    // Optional axle cap
+                    float ebAxleCandidate = T_engineBrake_eng * ratio * _ctx.settings.finalDrive * _ctx.settings.drivetrainEfficiency;
+                    float ebAxleSignedCap = (ebAxleCandidate < 0f) ? -EB_AXLE_MAX_NM : EB_AXLE_MAX_NM;
+                    if (Mathf.Abs(ebAxleCandidate) > Mathf.Abs(ebAxleSignedCap) && ratioAbsCurr > 1e-4f)
+                    {
+                        float scale = ebAxleSignedCap / Mathf.Max(1e-3f, ebAxleCandidate);
+                        T_engineBrake_eng *= scale;
+                    }
+
+                    // Apply & log
+                    T_req += T_engineBrake_eng;
+                    dbg.T_engineBrake_eng = T_engineBrake_eng;
+                    dbg.T_engineBrake_axle = T_engineBrake_eng * ratio * _ctx.settings.finalDrive * _ctx.settings.drivetrainEfficiency;
+                    dbg.engineBrakeWheelNm = dbg.T_engineBrake_axle;
                 }
 
-                // Engine braking (negative drive) always transmits via clutch during flywheel window 
-                if (!input.Handbrake && driveTorqueFromClutch < 0f)
+
+
+
+                if (_hardCutActive) { T_req = 0f; T_drag += HARD_CUT_NEG_TORQUE_NM; }
+                if (limiterActive) { T_drag *= (1f + LIMITER_EXTRA_DRAG_MULT * limiterT); }
+
+                // >>> NEW: inject engine-brake as engine-side negative torque when coupled & off-throttle
+
+
+                // Inertia torque & gearbox reaction
+
+                float omegaDot = (_engOmega - prevOmega) / Mathf.Max(0.000001f, dt);
+
+                // inertia contribution to clutch (decel => Tinertia > 0)
+                float Tinertia = -I * omegaDot;
+
+                // raw clutch torque before limits
+                float T_toGear_engineSide = T_req - T_drag + Tinertia;
+
+                float cap = (clutch >= RIGID_COUPLE_THR
+                            ? COUPLED_CAP_NM
+                            : CLUTCH_CAP_NM * Mathf.Clamp01(clutch) * (flywheelBlend ? POST_WINDOW_SCALE : 1f));
+
+                // If we are creeping (clutch not yet hard-coupled), allow a small,
+                // time-ramped engine-side capacity so wheels can start turning.
+                if (!physicallyCoupled && creepCap > cap) cap = creepCap;
+
+                T_toGear_engineSide = Mathf.Clamp(T_toGear_engineSide, -cap, cap);
+
+                if (reverseMotion && !pedalDown)
                 {
-                    float perWheelCoast = (-driveTorqueFromClutch) * 0.5f; // convert to brake torque 
-                    _ctx.RL.brakeTorque += perWheelCoast;
-                    _ctx.RR.brakeTorque += perWheelCoast;
+                    float axleCandidate = T_toGear_engineSide * ratio * _ctx.settings.finalDrive * _ctx.settings.drivetrainEfficiency;
+                    if (Mathf.Sign(axleCandidate) == motionDir) // would help the current roll direction
+                        T_toGear_engineSide = 0f;               // kill it
                 }
-                return; // Done — skip the old lerp path for this window 
+
+                // soften sign-chatter near 0 when lifted
+                bool blockPosOnLift = physicallyCoupled && !pedalDown && !input.Handbrake && !permitIdleCreep;
+                float targetClutchNm = T_toGear_engineSide;
+
+                if (blockPosOnLift && targetClutchNm > 0f)
+                {
+                    const float POS_HYS = 25f; // small hysteresis band (tune 10–50 Nm)
+                    targetClutchNm = Mathf.Max(0f, targetClutchNm - POS_HYS);
+                }
+
+                // slew so the sign can't flip abruptly between frames
+                float maxStep = TCLUTCH_SLEW * dt; // e.g. 10k Nm/s already defined
+                T_toGear_engineSide = Mathf.MoveTowards(_TclutchPrev, targetClutchNm, maxStep);
+                _TclutchPrev = T_toGear_engineSide;
+
+
+                // Axle reaction
+                // Gate torque transmission to the axle – neutral must not transmit
+
+
+                // No reverse coast at (near) standstill: hold the car instead of integrating to -∞
+                if (almostStopped && inGear && !pedalDown)
+                {
+                    // If this torque would drive the wheels in reverse in a forward gear, kill it.
+                    // (ratio>0 for forward gears; adjust sign rule if your ratios differ)
+                    if (ratio > 0f && T_toGear_engineSide < 0f) T_toGear_engineSide = 0f;
+                    if (ratio < 0f && T_toGear_engineSide > 0f) T_toGear_engineSide = 0f; // safety for reverse gear
+                }
+
+
+                bool allowTransmit = inGear && (ratioAbs > 1e-4f) && (clutch >= 0.75f);
+
+                // During creep: allow *positive* (forward) torque to flow even if clutch < 0.95
+                if (!allowTransmit && _idleAssistBlend > 0.001f && T_toGear_engineSide > 0f && ratio > 0f)
+                    allowTransmit = true;
+
+
+
+                // Kill reverse coast at near-standstill (prevents integrating to -∞)
+                if (almostStopped && inGear && !pedalDown)
+                {
+                    if (ratio > 0f && T_toGear_engineSide < 0f) T_toGear_engineSide = 0f; // forward gear, no negative
+                    if (ratio < 0f && T_toGear_engineSide > 0f) T_toGear_engineSide = 0f; // reverse gear, no positive
+                }
+
+                float axleTorque = 0f;
+                if (allowTransmit)
+                {
+                    axleTorque = T_toGear_engineSide * ratio * _ctx.settings.finalDrive * _ctx.settings.drivetrainEfficiency;
+                    float perWheel = axleTorque * 0.5f;
+                    _ctx.RL.motorTorque += perWheel;
+                    _ctx.RR.motorTorque += perWheel;
+                }
+
+
+                // ---- debug ----
+                dbg.axleTorque = axleTorque;
+                dbg.perWheelMotorNm = 0.5f * (_ctx.RL.motorTorque + _ctx.RR.motorTorque);
+
+
+
+                dbg.T_req = T_req;
+                dbg.T_drag = T_drag;
+                dbg.inertiaNm = Tinertia;
+                dbg.T_toGear_engineSide = T_toGear_engineSide;
+                dbg.axleTorque = axleTorque;
+                dbg.perWheelMotorNm = 0.5f * (_ctx.RL.motorTorque + _ctx.RR.motorTorque);
+                dbg.perWheelBrakeNm = 0.5f * (_ctx.RL.brakeTorque + _ctx.RR.brakeTorque);
+
+
+
+
+                // Kinematic sanity check
+                if (physicallyCoupled && ratioAbs > 0.0001f)
+                {
+                    float wheelRPS_mech = (_engineRPM / 60f) / ratioAbs;
+                    float speedMs_mech = wheelRPS_mech * (2f * Mathf.PI * _ctx.RL.radius);
+                    float kmh_mech = speedMs_mech * 3.6f;
+                    float kmh_body = _ctx.rb.velocity.magnitude * 3.6f;
+                    if (!float.IsInfinity(kmh_mech) && Mathf.Abs(kmh_mech - kmh_body) > 1.0f)
+                        Debug.LogWarning($"[Drive] Kinematic mismatch while coupled: engine-speed {kmh_mech:F1} km/h vs vehicle {kmh_body:F1} km/h (gear {gearIndex})");
+                }
+
+                if (physicallyCoupled && ratioAbs > 0.0001f)
+                {
+                    float wheelRPS_mech = (_engineRPM / 60f) / ratioAbs;
+                    float speedMs_mech = wheelRPS_mech * (2f * Mathf.PI * _ctx.RL.radius);
+                    dbg.mechSpeedKmh = speedMs_mech * 3.6f;
+                    dbg.kmhMismatch = Mathf.Abs(dbg.mechSpeedKmh - dbg.vehSpeedKmh);
+                }
+                DebugInfo = dbg;
+                return;
+
             }
-            else
+
+
+
+
+
+            // ------------------------
+            // Non-coupled path (neutral, clutch open, etc.)
+            // ------------------------
+            const float DOWN_FACTOR = 0.01f;
+
+            float inertiaUp = Mathf.Max(0.0001f, _ctx.settings.engineInertia);
+            float inertiaDown = Mathf.Max(0.0001f, _ctx.settings.engineInertia * DOWN_FACTOR);
+
+            if (neutralLike)
             {
-                // Fallback to your original asymmetric inertia lerp outside the window 
-                const float DOWN_FACTOR = 0.1f;
-                float inertiaUp = Mathf.Max(0.0001f, _ctx.settings.engineInertia);
-                float inertiaDown = Mathf.Max(0.0001f, _ctx.settings.engineInertia * DOWN_FACTOR);
-                float inertia = (targetRPMNormal < _engineRPM) ? inertiaDown : inertiaUp;
-                float alpha = Mathf.Clamp01(Time.fixedDeltaTime / inertia);
-                _engineRPM = Mathf.Clamp(
-                    Mathf.Lerp(_engineRPM, targetRPMNormal, alpha),
-                    _ctx.settings.idleRPM * 0.8f,
-                    _ctx.settings.revLimiterRPM + 200f
-                );
-                // keep your existing torque computation & wheel/brake logic below… 
+                inertiaUp = Mathf.Max(0.0001f, _ctx.settings.engineInertia * NEUTRAL_UP_MULT);
+                inertiaDown = Mathf.Max(0.0001f, _ctx.settings.engineInertia * NEUTRAL_DOWN_MULT);
             }
 
-            // ... 
-            if (!flywheelWindow)
+            float inertia = _hardCutActive ? inertiaDown : ((targetRPMNormal < _engineRPM) ? inertiaDown : inertiaUp);
+
+            if (!neutralLike && (targetRPMNormal < _engineRPM) && limiterT > 0f)
+                inertia = Mathf.Max(0.0001f, inertia / (1f + LIMITER_DECEL_MULT * limiterT));
+
+            float alpha = Mathf.Clamp01(Time.fixedDeltaTime / inertia);
+            _engineRPM = Mathf.Clamp(
+                Mathf.Lerp(_engineRPM, targetRPMNormal, alpha),
+                _ctx.settings.idleRPM,
+                _ctx.settings.revLimiterRPM + 200f
+            );
+
+            // Band-lock toward gear sync even here if clutch is nearly closed (insurance)
+            if (inGear && clutch >= 0.95f && !isShifting && !wantFreewheel)
             {
-                bool recentlyShifted = (Time.time - _lastShiftTime) < 0.35f;
-                if (_lastShiftWasUpshift && !pedalDown && recentlyShifted)
-                    _engineRPM = Mathf.MoveTowards(_engineRPM, targetRPMNormal, Time.fixedDeltaTime * 8000f);
+                float mechRPMNow = Mathf.Max(wheelRPM * ratioAbs, _ctx.settings.idleRPM);
+                float band = GEAR_LOCK_MARGIN_RPM;
+                float syncRate = 60000f; // rpm/s
+                if (_engineRPM > mechRPMNow + band)
+                    _engineRPM = Mathf.MoveTowards(_engineRPM, mechRPMNow + band, syncRate * Time.fixedDeltaTime);
+                else if (_engineRPM < mechRPMNow - band)
+                    _engineRPM = Mathf.MoveTowards(_engineRPM, mechRPMNow - band, syncRate * Time.fixedDeltaTime);
+                _engOmega = Mathf.Max(0f, _engineRPM * TWO_PI / 60f);
             }
 
-            if (_ctx.settings.roughIdle && !pedalDown && _gearIndex <= 2)
+
+
+            // Anti-hang extra fall on lift
+            if (!neutralLike)
+            {
+                float rpmDelta = _engineRPM - targetRPMNormal;
+                if (!pedalDown && rpmDelta > ANTI_HANG_DELTA_RPM)
+                {
+                    float k = Mathf.InverseLerp(ANTI_HANG_DELTA_RPM, ANTI_HANG_DELTA_RPM + 1500f, rpmDelta);
+                    float extraFall = LIFT_DECEL_RPM_PER_S * (0.5f + 1.5f * k);
+                    _engineRPM = Mathf.MoveTowards(_engineRPM, targetRPMNormal, extraFall * Time.fixedDeltaTime);
+                }
+            }
+
+            // Subtle pull-down after recent upshift if lifted
+            if (!_shift.IsShifting && _shift.LastShiftWasUpshift && !pedalDown && (Time.time - _shift.LastShiftTime) < 0.35f)
+                _engineRPM = Mathf.MoveTowards(_engineRPM, targetRPMNormal, Time.fixedDeltaTime * 8000f);
+
+            // Rough idle (only near idle & low gears)
+            if (_ctx.settings.roughIdle && !pedalDown && gearIndex == 1 && EngineRPM < 1300f)
             {
                 float noise = Mathf.PerlinNoise(Time.time * _ctx.settings.idleJitterSpeed, _idleNoiseOffset);
                 float centered = (noise - 0.5f) * 2f;
@@ -571,138 +926,96 @@ namespace Vehicle
                 _engineRPM = Mathf.Clamp(_engineRPM, _ctx.settings.idleRPM * 0.8f, _ctx.settings.revLimiterRPM + 200f);
             }
 
+            // Normal positive engine torque (non-coupled)
             float engineTorqueNormal = 0f;
-            if (pedalDown && !cutWindowActive && !liftCutActive)
+            if (pedalDown && !_shift.IsTorqueCutActive && !_shift.IsLiftCutActive)
             {
                 engineTorqueNormal = _ctx.settings.torqueCurve.Evaluate(_engineRPM) * throttle01 * _ctx.settings.torqueMultiplier;
-                engineTorqueNormal *= PostShiftScale();
+                engineTorqueNormal *= HighRpmFalloff(_engineRPM);
+                engineTorqueNormal *= _shift.PostShiftTorqueScale;
 
-                if (_gearIndex == 0) engineTorqueNormal *= _ctx.settings.reverseTorqueMultiplier;
+                if (_hardCutActive) engineTorqueNormal = 0f;
+
+                if (gearIndex == 0) engineTorqueNormal *= _ctx.settings.reverseTorqueMultiplier;
                 if (_engineRPM >= _ctx.settings.revLimiterRPM && throttle01 > 0.1f) engineTorqueNormal = 0f;
 
-                // launch softening (keep yours)
-                if (_launchState == LaunchState.Active && inFirst)
+                if (launchActive && inFirst && !instantActive)
                 {
-                    float tL = Mathf.Clamp01((Time.time - _launchStartTime) / 0.5f);
+                    float tL = Mathf.Clamp01((Time.time - _shift.LastShiftTime) / 0.5f);
                     float vL = Mathf.Clamp01(speedMs / 2.0f);
                     float ease = tL * tL * (3f - 2f * tL);
                     float blend = Mathf.Max(0.25f, Mathf.Min(1f, 0.25f + 0.75f * Mathf.Max(ease, vL)));
                     engineTorqueNormal *= blend;
                 }
             }
-            // extra RPM pull-down on lift (keep as you had) 
+
+            // Extra pull-down on lift
             if (!pedalDown && _engineRPM > _ctx.settings.idleRPM * 1.1f)
             {
-                _engineRPM = Mathf.MoveTowards(_engineRPM, targetRPMNormal, Time.fixedDeltaTime * 4000f);
+                if (!neutralLike) // in gear: gentle extra damping is fine
+                    _engineRPM = Mathf.MoveTowards(_engineRPM, targetRPMNormal, Time.fixedDeltaTime * 4000f);
             }
 
-            float driveTorque = engineTorqueNormal * GetCurrentRatio() * _ctx.settings.finalDrive * _ctx.settings.drivetrainEfficiency * _clutch;
+            // Reverse explicit drive (non-coupled)
+            if (gearIndex == 0 && pedalDown && !_shift.IsTorqueCutActive && !_shift.IsLiftCutActive)
+            {
+                float baseNm = _ctx.settings.torqueCurve.Evaluate(Mathf.Max(_engineRPM, _ctx.settings.idleRPM))
+                               * throttle01 * _ctx.settings.torqueMultiplier
+                               * Mathf.Max(0.1f, _ctx.settings.reverseTorqueMultiplier);
 
-            // Hard kill of drive torque if any cut window is active OR no pedal 
-            if (!pedalDown || cutWindowActive || liftCutActive)
+                float axleAbs = Mathf.Abs(ratio * _ctx.settings.finalDrive) * _ctx.settings.drivetrainEfficiency;
+                float axleNm = -baseNm * axleAbs * Mathf.Clamp01(_shift.Clutch); // negative = reverse
+                float perWheel = axleNm * 0.5f;
+
+                _ctx.RL.motorTorque = perWheel;
+                _ctx.RR.motorTorque = perWheel;
+                return;
+            }
+
+            // Drive or kill if cuts/hard-cut/lift (keep drive in soft limiter band)
+            float driveTorque = engineTorqueNormal * ratio * _ctx.settings.finalDrive * _ctx.settings.drivetrainEfficiency * Mathf.Clamp01(clutch);
+            if (!pedalDown || _shift.IsTorqueCutActive || _shift.IsLiftCutActive || _hardCutActive)
             {
                 _ctx.RL.motorTorque = 0f;
                 _ctx.RR.motorTorque = 0f;
             }
             else
             {
-                float perWheelTorque = driveTorque * 0.5f; // RWD 
+                if (limiterActive) driveTorque *= Mathf.Lerp(1f, 0.6f, limiterT); // gentle taper only
+                float perWheelTorque = driveTorque * 0.5f; // RWD
                 _ctx.RL.motorTorque = perWheelTorque;
                 _ctx.RR.motorTorque = perWheelTorque;
             }
 
-            bool clutchEngaged = _clutch > 0.95f;
-            bool noService = !input.Handbrake;
-            if (inGear && clutchEngaged && !pedalDown && noService)
-            {
-                float rpmFactor = Mathf.InverseLerp(
-                    _ctx.settings.idleRPM * 0.9f,
-                    _ctx.settings.maxRPM,
-                    Mathf.Clamp(_engineRPM, _ctx.settings.idleRPM * 0.9f, _ctx.settings.maxRPM)
-                );
-                float coastBoost = (cutWindowActive || liftCutActive) ? POST_SHIFT_COAST : 1f;
-                float coastNmAtWheel = _ctx.settings.engineBrakeTorque * ratioAbs * _ctx.settings.drivetrainEfficiency * rpmFactor * coastBoost;
-                float perWheelCoast = coastNmAtWheel * 0.5f;
-                _ctx.RL.brakeTorque += perWheelCoast;
-                _ctx.RR.brakeTorque += perWheelCoast;
-            }
 
-            // NEW: coast assist during shifts / partial clutch (covers all gears) 
-            // Only for upshifts so downshifts don't feel grabby 
-            if (_lastShiftWasUpshift && inGear && !pedalDown && noService && (_isShifting || _clutch < 0.95f))
-            {
-                float ratioAbsDyn = Mathf.Abs(GetCurrentRatio() * _ctx.settings.finalDrive);
-                float tShift = Mathf.Clamp01(_shiftTimer / Mathf.Max(0.0001f, _ctx.settings.shiftTime));
-                float clutchScale = Mathf.SmoothStep(0f, 1f, _clutch);
-                float shiftSnap = Mathf.Lerp(0.35f, 1.0f, tShift);
-                float rpmFactor = Mathf.InverseLerp(
-                    _ctx.settings.idleRPM * 0.9f,
-                    _ctx.settings.maxRPM,
-                    Mathf.Clamp(_engineRPM, _ctx.settings.idleRPM * 0.9f, _ctx.settings.maxRPM)
-                );
-                float coastNmAtWheel = _ctx.settings.engineBrakeTorque * ratioAbsDyn * _ctx.settings.drivetrainEfficiency * rpmFactor * clutchScale * shiftSnap;
-                float perWheelCoast = coastNmAtWheel * 0.5f;
-                _ctx.RL.brakeTorque += perWheelCoast;
-                _ctx.RR.brakeTorque += perWheelCoast;
-            }
+
+            // Guard the hard-cut cap only when not mechanically coupled
+            if (_hardCutActive && !physicallyCoupled && _engineRPM > HARD_CUT_RPM - HARD_CUT_RPM_CAP_MARGIN)
+                _engineRPM = HARD_CUT_RPM - HARD_CUT_RPM_CAP_MARGIN;
+
+            dbg.runTwoMass = false;
+            dbg.coupledNow = false;
+            dbg.engineRPM = _engineRPM;
+            dbg.engOmega = _engOmega;
+            dbg.perWheelMotorNm = 0.5f * (_ctx.RL.motorTorque + _ctx.RR.motorTorque);
+            dbg.perWheelBrakeNm = 0.5f * (_ctx.RL.brakeTorque + _ctx.RR.brakeTorque);
+            DebugInfo = dbg;
+
+
         }
 
-        private float GetCurrentRatio() => _ctx.settings.gearRatios[Mathf.Clamp(_gearIndex, 0, _ctx.settings.gearRatios.Length - 1)];
-
-        private float GetWheelRPMFromGround()
+        private float HighRpmFalloff(float rpm)
         {
-            float r = _ctx.RL.radius; // <- no parentheses 
-            float wheelRPS = _ctx.rb.velocity.magnitude / (2f * Mathf.PI * r);
-            return wheelRPS * 60f;
+            // End the taper a bit before the hard limiter
+            float end = Mathf.Max(POWER_TAPER_START_RPM + 100f, _ctx.settings.revLimiterRPM - POWER_TAPER_END_OFFSET);
+            if (rpm <= POWER_TAPER_START_RPM) return 1f;
+            if (rpm >= end) return 0f;
+
+            float t = Mathf.InverseLerp(POWER_TAPER_START_RPM, end, rpm);
+            // Aggressive drop: (smoothstep)^2
+            float s = t * t * (3f - 2f * t);
+            return 1f - s * s; // 1 → 0 quickly as rpm rises through the taper band
         }
 
-        public void ShiftUp()
-        {
-            if (_gearIndex < _ctx.settings.gearRatios.Length - 1) StartShift(_gearIndex + 1);
-        }
-
-        public void ShiftDown()
-        {
-            int target = _gearIndex - 1;
-            if (target == 0 && _ctx.rb.velocity.magnitude > 0.5f) target = 1;
-            StartShift(target);
-        }
-
-        private void StartShift(int newIndex)
-        {
-            newIndex = Mathf.Clamp(newIndex, 0, _ctx.settings.gearRatios.Length - 1);
-            if (newIndex == _gearIndex) return;
-
-            int old = _gearIndex;
-            _gearIndex = newIndex;
-            _isShifting = true;
-            _shiftTimer = 0f;
-            _lastShiftTime = Time.time;
-            _lastShiftWasUpshift = (newIndex > old);
-            _postShiftFromGear = old;
-            _torqueCutUntil = Time.time + _ctx.settings.shiftTime + CUT_AFTER_SHIFT;
-            _launchState = LaunchState.Cooldown;
-            _launchCooldownUntil = Time.time + LAUNCH_COOLDOWN;
-
-            OnGearChanged?.Invoke(old, newIndex);
-            _gearDwellUntil = Time.time + GEAR_DWELL_TIME;
-        }
-
-        private void SetReverseInstant()
-        {
-            _gearIndex = 0;
-            _isShifting = false;
-            _shiftTimer = 0f;
-        }
-
-        private float PostShiftScale()
-        {
-            if (Time.time >= _postShiftFadeUntil) return 1f;
-            float fadeStart = _postShiftFadeUntil - POST_SHIFT_FADE_12;   // start when we set _postShiftFadeUntil
-            float t = Mathf.InverseLerp(fadeStart, _postShiftFadeUntil, Time.time);  // 0→1 over the fade window
-            float minAfter = 0.55f;                                       // same flavor you had
-            float smooth = t * t * (3f - 2f * t);                         // smoothstep
-            return Mathf.Lerp(minAfter, 1f, smooth);
-        }
     }
 }

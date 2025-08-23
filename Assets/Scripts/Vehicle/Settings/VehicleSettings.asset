@@ -23,21 +23,21 @@ MonoBehaviour:
   steerInputFollow: 0.12
   yawDampAt0Kmh: 0
   yawDampAt120Kmh: 0.25
-  brakeForce: 5000
-  handbrakeForce: 7000
+  brakeForce: 3919
+  handbrakeForce: 6991
   absEnabledDefault: 0
   absThreshold: 0.1
   absReleaseTime: 0.1
   absToggleKey: 98
   automatic: 1
   idleRPM: 1100
-  maxRPM: 7500
-  revLimiterRPM: 7200
-  engineInertia: 0.17
-  shiftUpRPM: 6800
+  maxRPM: 7600
+  revLimiterRPM: 7400
+  engineInertia: 0.61
+  shiftUpRPM: 6700
   shiftDownRPM: 4000
-  shiftTime: 0.35
-  engineBrakeTorque: 150
+  shiftTime: 0.25
+  engineBrakeTorque: 104
   torqueCurve:
     serializedVersion: 2
     m_Curve:
@@ -90,8 +90,8 @@ MonoBehaviour:
     m_PostInfinity: 2
     m_RotationOrder: 4
   drivetrainEfficiency: 0.9
-  torqueMultiplier: 1.44
-  minLaunchRPM: 2000
+  torqueMultiplier: 1.58
+  minLaunchRPM: 1500
   finalDrive: 6.59
   gearRatios:
   - -4.78
@@ -105,13 +105,17 @@ MonoBehaviour:
   minShiftInterval: 0.35
   predictedDownshiftMargin: 1.15
   reverseTorqueMultiplier: 1.54
+  launchControlEnabledDefault: 1
+  launchInstantTorqueDefault: 1
+  launchControlToggleKey: 108
+  launchModeToggleKey: 107
   roughIdle: 1
-  idleJitterAmplitude: 80
-  idleJitterSpeed: 2
-  frontAntiRoll: 16500
-  rearAntiRoll: 13000
-  downforceCoef: 25
+  idleJitterAmplitude: 20
+  idleJitterSpeed: 5
+  frontAntiRoll: 10000
+  rearAntiRoll: 6000
+  downforceCoef: 15
   dpadYAxisName: DPadY
   dpadPressThreshold: 0.6
   dpadRepeatDelay: 0.25
-  smokeSlipThreshold: 0.94
+  smokeSlipThreshold: 1.58

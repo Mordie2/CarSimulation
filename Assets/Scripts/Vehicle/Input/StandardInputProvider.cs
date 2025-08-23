@@ -3,9 +3,8 @@
 namespace Vehicle
 {
     /// <summary>
-    /// Legacy Input Manager provider that auto-detects whether the pad uses
-    /// a combined "Triggers" axis (RT=+, LT=-, rest=0) or separate RT/LT axes.
-    /// Also supports keyboard fallback (W/S, arrows) and has deadzones.
+    /// Legacy Input Manager provider that auto-detects trigger layout (combined or separate),
+    /// supports keyboard fallback, and adds D-Pad Up/Down shifting (axis or button).
     /// </summary>
     public class StandardInputProvider : IInputProvider
     {
@@ -15,11 +14,18 @@ namespace Vehicle
         static readonly string[] AXIS_LT = { "ControllerBrake", "LT", "LeftTrigger", "L2", "TriggerL", "Axis 9", "8th axis", "Axis 4" };
         static readonly string[] AXIS_STEER = { "JoystickHorizontal", "LeftStickX", "Horizontal", "Axis 1" };
         static readonly string[] AXIS_VERT_KB = { "Vertical" };
+
+        // DPAD (vertical) axis names vary by platform/driver
+        static readonly string[] AXIS_DPAD_V = { "DPadY", "DPadVertical", "D-Pad Y", "Axis 7", "7th axis", "Axis 6" };
+
+        // Optional: if you mapped D-Pad to buttons in the Input Manager
+        static readonly string[] BTN_DPAD_UP = { "DPadUp", "DPAD UP", "D-Pad Up" };
+        static readonly string[] BTN_DPAD_DOWN = { "DPadDown", "DPAD DOWN", "D-Pad Down" };
+
         static readonly string[] BTN_HANDBRAKE = { "Handbrake" };
 
-        const float DZ = 0.07f;
-
-
+        const float DZ = 0.07f;     // stick/trigger deadzone
+        const float HAT_THR = 0.5f; // D-Pad axis threshold
 
         // Detection cache
         bool _useCombined;
@@ -28,12 +34,19 @@ namespace Vehicle
         string _axisLT;
         string _axisSteer;
         string _axisVertKB;
+        string _axisDpadV;
 
         // Debug values
         private float _lastRawRT = 0f;
         private float _lastRawLT = 0f;
 
-        public static bool debugInput = true; // toggle this on/off
+        // D-Pad edge detection state
+        private bool _prevDpadUp;
+        private bool _prevDpadDown;
+        private bool _shiftUpPulse;    // latched for one frame
+        private bool _shiftDownPulse;  // latched for one frame
+
+        public static bool debugInput = false;
 
         [SerializeField] private bool triggersAreZeroToNegOne = true;
 
@@ -41,9 +54,7 @@ namespace Vehicle
         {
             TryPickAxis(AXIS_STEER, out _axisSteer);
             TryPickAxis(AXIS_VERT_KB, out _axisVertKB);
-
-            if (!_useCombined && string.IsNullOrEmpty(_axisRT) && string.IsNullOrEmpty(_axisLT))
-                Debug.LogWarning("[Input] No trigger axes found. Using keyboard only (W/S).");
+            TryPickAxis(AXIS_DPAD_V, out _axisDpadV);
 
             // pick separate first
             TryPickAxis(AXIS_RT, out _axisRT);
@@ -53,8 +64,13 @@ namespace Vehicle
             if (string.IsNullOrEmpty(_axisRT) && string.IsNullOrEmpty(_axisLT))
                 TryPickAxis(AXIS_TRIGGERS, out _axisCombined);
             else
-                _axisCombined = null; // disable combined if we have separate
+                _axisCombined = null;
 
+            if (string.IsNullOrEmpty(_axisRT) && string.IsNullOrEmpty(_axisLT) && string.IsNullOrEmpty(_axisCombined))
+                Debug.LogWarning("[Input] No trigger axes found. Using keyboard only (W/S).");
+
+            if (string.IsNullOrEmpty(_axisDpadV))
+                Debug.Log("[Input] No D-Pad vertical axis found; will try button fallback if defined.");
         }
 
         // -------- IInputProvider --------
@@ -73,10 +89,48 @@ namespace Vehicle
         public bool Handbrake =>
             GetButtonAny(BTN_HANDBRAKE) || Input.GetKey(KeyCode.Space);
 
-        public bool RequestShiftUp => Input.GetKeyDown(KeyCode.E);
-        public bool RequestShiftDown => Input.GetKeyDown(KeyCode.Q);
+        public bool RequestShiftUp
+        {
+            get
+            {
+                bool fromKeyboard = Input.GetKeyDown(KeyCode.E);
+                bool fromButtons = GetButtonDownAny(BTN_DPAD_UP);
+                bool fromAxis = ConsumePulse(ref _shiftUpPulse);
+                return fromKeyboard || fromButtons || fromAxis;
+            }
+        }
 
-        public void Update() { }
+        public bool RequestShiftDown
+        {
+            get
+            {
+                bool fromKeyboard = Input.GetKeyDown(KeyCode.Q);
+                bool fromButtons = GetButtonDownAny(BTN_DPAD_DOWN);
+                bool fromAxis = ConsumePulse(ref _shiftDownPulse);
+                return fromKeyboard || fromButtons || fromAxis;
+            }
+        }
+
+        public void Update()
+        {
+            // Latch D-Pad pulses (axis path)
+            if (!string.IsNullOrEmpty(_axisDpadV))
+            {
+                float v = ReadAxisRaw(_axisDpadV);
+                bool upNow = v > HAT_THR;
+                bool dnNow = v < -HAT_THR;
+
+                if (upNow && !_prevDpadUp) _shiftUpPulse = true;
+                if (dnNow && !_prevDpadDown) _shiftDownPulse = true;
+
+                _prevDpadUp = upNow;
+                _prevDpadDown = dnNow;
+            }
+
+            // Also latch pulses via button fallback (if you mapped them)
+            if (GetButtonDownAny(BTN_DPAD_UP)) _shiftUpPulse = true;
+            if (GetButtonDownAny(BTN_DPAD_DOWN)) _shiftDownPulse = true;
+        }
 
         public float Throttle
         {
@@ -121,14 +175,9 @@ namespace Vehicle
             return (v < 0f) ? Mathf.Clamp01((v + 1f) * 0.5f) : Mathf.Clamp01(v);
         }
 
-        // Deadzones
-        static float Deadzone01(float x, float dz = 0.07f) => x <= dz ? 0f : (x - dz) / (1f - dz);
-        static float DeadzoneSigned(float x, float dz = 0.07f) => Mathf.Abs(x) < dz ? 0f : x;
-
         // -------- Triggers --------
         void ReadTriggers(out float rt01, out float lt01)
         {
-            // Prefer separate axes if they exist; only use combined if neither is found
             bool haveRT = !string.IsNullOrEmpty(_axisRT);
             bool haveLT = !string.IsNullOrEmpty(_axisLT);
             bool useCombined = (!haveRT && !haveLT) && !string.IsNullOrEmpty(_axisCombined);
@@ -142,7 +191,7 @@ namespace Vehicle
             }
             else
             {
-                float rtSep = ReadAxisRaw(_axisRT);      // your case: 0..-1
+                float rtSep = ReadAxisRaw(_axisRT);
                 float ltSep = ReadAxisRaw(_axisLT);
                 _lastRawRT = rtSep; _lastRawLT = ltSep;
 
@@ -150,7 +199,6 @@ namespace Vehicle
                 lt01 = Deadzone01(MapSeparateTriggerTo01(ltSep));
             }
         }
-
 
         // -------- Helpers --------
         static float Deadzone01(float x)
@@ -202,6 +250,22 @@ namespace Vehicle
                 try { if (Input.GetButton(n)) return true; } catch { }
             }
             return false;
+        }
+
+        static bool GetButtonDownAny(string[] names)
+        {
+            foreach (var n in names)
+            {
+                try { if (Input.GetButtonDown(n)) return true; } catch { }
+            }
+            return false;
+        }
+
+        static bool ConsumePulse(ref bool pulse)
+        {
+            if (!pulse) return false;
+            pulse = false;
+            return true;
         }
     }
 }

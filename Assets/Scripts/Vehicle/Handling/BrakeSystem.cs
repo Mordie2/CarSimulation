@@ -22,28 +22,34 @@ namespace Vehicle
 
         public void TickBase(IInputProvider input, bool inReverse, bool isBurnout)
         {
-            
-            _ctx.FL.brakeTorque = 0f;
-            _ctx.FR.brakeTorque = 0f;
-            _ctx.RL.brakeTorque = 0f;
-            _ctx.RR.brakeTorque = 0f;
-            
-            // 🔥 Burnout: fronts locked, rears free
+            _ctx.FL.brakeTorque = _ctx.FR.brakeTorque = _ctx.RL.brakeTorque = _ctx.RR.brakeTorque = 0f;
+
             if (isBurnout)
             {
                 float frontLock = _ctx.settings.brakeForce;
                 _ctx.FL.brakeTorque = frontLock;
                 _ctx.FR.brakeTorque = frontLock;
-                _ctx.RL.brakeTorque = 0f;
-                _ctx.RR.brakeTorque = 0f;
                 return;
             }
 
-            // Arcade reverse braking:
-            // - Forward gears: service brake = Brake pedal
-            // - Reverse gear:  service brake = Gas pedal (throttle)
-            float serviceBrake01 = inReverse ? Mathf.Clamp01(input.Throttle)   // gas = brake in R
-                                             : Mathf.Clamp01(input.Brake);     // brake = brake in D
+            bool manualMode = !_ctx.settings.automatic;
+
+            // Manual: brake pedal always brakes (even in reverse).
+            // Auto:   forward uses Brake; reverse uses Brake-as-throttle, so service brake is 0 here.
+            float serviceBrake01;
+            if (manualMode)
+            {
+                // Manual: brake pedal is always the brake (fronts work in R too)
+                serviceBrake01 = Mathf.Clamp01(input.Brake);        // LT
+            }
+            else
+            {
+                // Auto:
+                // - Forward: LT = service brake (as usual)
+                // - Reverse: RT becomes the service brake so player can stop in R
+                serviceBrake01 = inReverse ? Mathf.Clamp01(input.Throttle)  // RT
+                                           : Mathf.Clamp01(input.Brake);    // LT
+            }
 
             float brakeTorque = serviceBrake01 * _ctx.settings.brakeForce;
             _ctx.FL.brakeTorque = brakeTorque;
@@ -51,7 +57,6 @@ namespace Vehicle
             _ctx.RL.brakeTorque = brakeTorque;
             _ctx.RR.brakeTorque = brakeTorque;
 
-            // Handbrake adds on the rear axle
             if (input.Handbrake)
             {
                 float hb = _ctx.settings.handbrakeForce;
@@ -61,15 +66,10 @@ namespace Vehicle
         }
 
 
-
-
         public void TickABS(bool isBurnout)
         {
             if (!_absEnabled) return;
-
-            // During burnout we’re intentionally locking fronts; skip ABS entirely
             if (isBurnout) return;
-
             if (TotalBrakeDemand01() <= 0.01f) return;
 
             ApplyABSOnWheel(_ctx.FL);

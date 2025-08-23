@@ -45,7 +45,7 @@ namespace Vehicle
         new Keyframe(2500f, 240f),
         new Keyframe(4000f, 300f),
         new Keyframe(6000f, 340f),
-        new Keyframe(7200f, 300f)
+        new Keyframe(7200f, 200f)
         );
         [Range(0.5f, 1.0f)] public float drivetrainEfficiency = 0.90f;
         public float torqueMultiplier = 1.4f;
@@ -56,6 +56,13 @@ namespace Vehicle
         public float minShiftInterval = 0.35f;
         public float predictedDownshiftMargin = 1.15f;
         public float reverseTorqueMultiplier = 1.35f;
+
+        [Header("Launch Control")]
+        public bool launchControlEnabledDefault = true;
+        public bool launchInstantTorqueDefault = false;   // Instant mode = no softening + immediate drive
+        public KeyCode launchControlToggleKey = KeyCode.L; // optional keyboard toggle
+        public KeyCode launchModeToggleKey = KeyCode.K;    // optional: toggle instant vs smart
+
 
         // Rough idle/jitter settings
         public bool roughIdle = true;

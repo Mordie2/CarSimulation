@@ -20,14 +20,14 @@ namespace Vehicle
         public VehicleSettings settings; // ScriptableObject for tunables (optional, but recommended)
 
         // Runtime state exposed for HUD/Debug
-        public float speedMs; // via custom ReadOnly attribute or ignore
+        public float speedMs;
         public string gearLabel;
         public int engineRPMRounded;
         public bool absEnabled = true;
 
         // --- Compatibility properties for older scripts (CarEffects, etc.) ---
-        public float EngineRPM => _drivetrain.EngineRPM;                 // already suggested earlier
-        public int CurrentGear => _drivetrain.GearIndex;                 // add GearIndex getter in DrivetrainSystem
+        public float EngineRPM => _drivetrain.EngineRPM;
+        public int CurrentGear => _drivetrain.GearIndex;      // proxied by DrivetrainSystem
         public string GearLabel => _drivetrain.GearLabel;
         public float speed => _ctx.rb ? _ctx.rb.velocity.magnitude : 0f;
 
@@ -48,10 +48,9 @@ namespace Vehicle
             return false;
         }
 
-
         private bool ComputeSmoke_Compat()
         {
-            float th = _ctx.settings.smokeSlipThreshold;  // add to VehicleSettings below
+            float th = _ctx.settings.smokeSlipThreshold;
             bool smoking = false;
 
             if (_ctx.RL.GetGroundHit(out var hl))
@@ -71,9 +70,7 @@ namespace Vehicle
         private DrivetrainSystem _drivetrain;
         private SuspensionAeroSystem _suspensionAero;
         private WheelPoseUpdater _wheelPose;
-
         private CarAudioSystem _audio;
-
 
         // Cached context passed into systems
         private VehicleContext _ctx;
@@ -99,7 +96,7 @@ namespace Vehicle
 
             _steering = new SteeringSystem(_ctx);
             _brakes = new BrakeSystem(_ctx);
-            _drivetrain = new DrivetrainSystem(_ctx);
+            _drivetrain = new DrivetrainSystem(_ctx);  // <-- unified shift + powertrain
 
             _suspensionAero = new SuspensionAeroSystem(_ctx);
             _wheelPose = new WheelPoseUpdater(
@@ -132,21 +129,16 @@ namespace Vehicle
 
         private void FixedUpdate()
         {
-            if (speedMs < 2f)
-            {
-                Debug.Log($"[Input] throttle={_input.Throttle:0.00} brake={_input.Brake:0.00} horiz={_input.Horizontal:0.00}");
-            }
-
             speedMs = _rb.velocity.magnitude;
 
             // 1) Steering FIRST so wheel angles are updated every physics step
             _steering.Tick(_input.Horizontal, speedMs);
 
-            // 2) Compute burnout once
+            // 2) Compute burnout once (gas + brake + near stop)
             bool burnout = (_input.Throttle > 0.9f && _input.Brake > 0.9f && speedMs < 3f);
 
-            // 3) Decide gear BEFORE brakes (so reverse engages immediately)
-            _drivetrain.TickShifting(_input, speedMs, burnout);
+            // 3) NEW: Shifting + Powertrain in one go (decide gear BEFORE brakes)
+            _drivetrain.Tick(_input, speedMs, burnout);
 
             // 4) Brakes / ABS with correct reverse flag & burnout
             _brakes.TickBase(_input, _drivetrain.IsInReverse, burnout);
@@ -155,10 +147,7 @@ namespace Vehicle
             // 5) Aero & anti-roll
             _suspensionAero.Tick();
 
-            // 6) Powertrain AFTER brakes
-            _drivetrain.TickPowertrain(_input, speedMs, burnout);
-
-            // 7) Visuals & audio
+            // 6) Visuals & audio
             _wheelPose.UpdateAll();
             _audio?.OnFixedUpdate(_drivetrain.EngineRPM, Mathf.Abs(_input.Throttle));
 
@@ -169,9 +158,7 @@ namespace Vehicle
 
         private void OnDestroy()
         {
-
             _audio?.Dispose();
-
         }
     }
 }
