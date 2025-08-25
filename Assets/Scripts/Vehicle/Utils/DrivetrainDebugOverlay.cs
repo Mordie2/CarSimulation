@@ -136,7 +136,7 @@ namespace Vehicle.Debugging
 
             Space(ref y);
             GUI.Label(new Rect(innerX + backgroundPadding, y + backgroundPadding, innerW - backgroundPadding * 2, lineHeight),
-                      "F9 to toggle • scale/position in inspector", _monoSmall);
+                      "F9 to toggle", _monoSmall);
         }
 
         // Measure pass: mirror layout to get total height (no dynamic)

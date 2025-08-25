@@ -13,8 +13,8 @@ namespace Vehicle
         public WheelCollider FL, FR, RL, RR;
         public VehicleSettings settings;
         public MonoBehaviour host; // for coroutines if needed
-
-
+        public CarAudioSystem audio;
+        public CarEffects effects;
         public float KmH => rb != null ? rb.velocity.magnitude * 3.6f : 0f;
     }
 }

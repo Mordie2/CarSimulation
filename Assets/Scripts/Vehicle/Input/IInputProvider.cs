@@ -10,6 +10,7 @@ namespace Vehicle
         float Throttle { get; } // 0..1 forward, negative values used by drivetrain for reverse intent
         float Brake { get; } // 0..1 service brake
         bool Handbrake { get; }
+        bool RequestEngineToggle { get; }
 
 
         // Manual shifting

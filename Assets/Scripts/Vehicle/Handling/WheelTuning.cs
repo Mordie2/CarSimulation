@@ -1,5 +1,5 @@
 // =============================================
-// File: Scripts/Vehicle/Utils/WheelTuning.cs
+// File: Scripts/Vehicle/Handling/WheelTuning.cs
 // Role: One place for friction/suspension tweaks
 // =============================================
 using UnityEngine;
@@ -13,7 +13,7 @@ namespace Vehicle
             float fLat = 1.45f, float rLat = 1.30f)
         {
             var fwd = c.forwardFriction;
-            fwd.extremumSlip = 0.6f; fwd.asymptoteSlip = 1.2f; fwd.extremumValue = 1.1f; fwd.asymptoteValue = 0.85f;
+            fwd.extremumSlip = 0.8f; fwd.asymptoteSlip = 1.2f; fwd.extremumValue = 1.1f; fwd.asymptoteValue = 0.85f;
             fwd.stiffness = isFront ? fLong : rLong; c.forwardFriction = fwd;
 
             var lat = c.sidewaysFriction;
@@ -22,8 +22,6 @@ namespace Vehicle
 
             var sp = c.suspensionSpring; sp.spring = 85000f; sp.damper = 7500f; c.suspensionSpring = sp;
         }
-
-        // Convenience accessors
         public static WheelCollider RL(this VehicleContext ctx) => ctx.RL;
         public static WheelCollider RR(this VehicleContext ctx) => ctx.RR;
     }

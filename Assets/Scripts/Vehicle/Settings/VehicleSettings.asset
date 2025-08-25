@@ -31,8 +31,8 @@ MonoBehaviour:
   absToggleKey: 98
   automatic: 1
   idleRPM: 1100
-  maxRPM: 7600
-  revLimiterRPM: 7400
+  maxRPM: 7500
+  revLimiterRPM: 7300
   engineInertia: 0.61
   shiftUpRPM: 6700
   shiftDownRPM: 4000
@@ -90,8 +90,8 @@ MonoBehaviour:
     m_PostInfinity: 2
     m_RotationOrder: 4
   drivetrainEfficiency: 0.9
-  torqueMultiplier: 1.58
-  minLaunchRPM: 1500
+  torqueMultiplier: 1.36
+  minLaunchRPM: 1000
   finalDrive: 6.59
   gearRatios:
   - -4.78

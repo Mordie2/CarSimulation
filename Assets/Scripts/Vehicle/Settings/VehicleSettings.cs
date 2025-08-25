@@ -1,6 +1,7 @@
 // =============================================
 // File: Scripts/Vehicle/Settings/VehicleSettings.cs
 // Role: Tunables (can be ScriptableObject)
+// KINDA LEGACY, NEEDS UPDATE!!
 // =============================================
 using UnityEngine;
 
@@ -13,8 +14,8 @@ namespace Vehicle
         [Header("Steering")]
         public float maxSteerAngle = 35f;
         public float steerAtSpeedKmh = 140f;
-        public float minSteerScaleLow = 1.0f; // at 0 km/h
-        public float minSteerScaleHigh = 0.30f; // at high speed
+        public float minSteerScaleLow = 1.0f;
+        public float minSteerScaleHigh = 0.30f;
         public float steerRateDegPerSecLow = 420f;
         public float steerRateDegPerSecHigh = 220f;
         public float steerSmoothing = 0.08f;
@@ -59,9 +60,9 @@ namespace Vehicle
 
         [Header("Launch Control")]
         public bool launchControlEnabledDefault = true;
-        public bool launchInstantTorqueDefault = false;   // Instant mode = no softening + immediate drive
-        public KeyCode launchControlToggleKey = KeyCode.L; // optional keyboard toggle
-        public KeyCode launchModeToggleKey = KeyCode.K;    // optional: toggle instant vs smart
+        public bool launchInstantTorqueDefault = false; 
+        public KeyCode launchControlToggleKey = KeyCode.L; 
+        public KeyCode launchModeToggleKey = KeyCode.K;    
 
 
         // Rough idle/jitter settings
@@ -82,13 +83,12 @@ namespace Vehicle
         public float dpadRepeatDelay = 0.25f;
 
         [Header("FX / VFX thresholds")]
-        public float smokeSlipThreshold = 0.45f;   // tweak to taste (0.35–0.6 typical)
+        public float smokeSlipThreshold = 0.45f; 
 
 
         public static VehicleSettings DefaultRuntimeCopy()
         {
             var s = ScriptableObject.CreateInstance<VehicleSettings>();
-            // defaults already set via field initializers
             return s;
         }
     }

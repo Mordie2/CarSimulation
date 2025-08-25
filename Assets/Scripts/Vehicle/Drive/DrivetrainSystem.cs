@@ -73,19 +73,15 @@ namespace Vehicle
             public float mechSpeedKmh;
             public float kmhMismatch;
         }
-
         public DebugState DebugInfo { get; private set; }
         public static readonly List<DrivetrainSystem> Instances = new List<DrivetrainSystem>();
         // ===== /Debug =====
-
         private readonly VehicleContext _ctx;
         private readonly ShiftSystem _shift;
-
 
         // Engine state
         private float _engineRPM = 1000f;
         private float _idleNoiseOffset = 0f;
-
         public float EngineRPM => _engineRPM;
 
         // Flywheel (2-mass style window)
@@ -98,27 +94,21 @@ namespace Vehicle
         private const float TCLUTCH_SLEW = 4000f; // Nm/s
 
         // Clutch/drag tunables (used in flywheel window)
-        private const float CLUTCH_CAP_NM = 12000f;
-        private const float CLUTCH_VISCOUS = 3f;
+        private const float CLUTCH_CAP_NM = 120000f;
         private const float ENGINE_DRAG_IDLE = 20f;
         private const float ENGINE_DRAG_COEF = 0.10f;
-        private const float SHIFT_CLUTCH_SCALE = 0.25f;  // reduced capacity during active shift
-        private const float SLIP_DEADZONE = 4f;          // rad/s
         private const float POST_WINDOW_SCALE = 0.90f;   // soften capacity just after shift
-        private const float CLUTCH_POS_ENABLE = 0.98f;   // nearly closed
         private const float POS_TORQUE_REARM = 0.04f;    // s after shift end
         private const float POS_TORQUE_THR = 0.25f;      // require real pedal
         private const float SYNC_RPM_RATE = 120000f; // rpm per second when clutch is (nearly) closed
         private const float RIGID_COUPLE_THR = 0.995f;    // one source of truth
         private const float SLIP_LOCK_EPS = 45f;          // rad/s -> snap when nearly synced
-        private const float COAST_CLUTCH_THR = 0.95f; // apply engine brake from here up
 
         // --- Creep / bite-in at standstill (first gear) ---
         private const float CREEP_MAX_CAP_NM = 800f;   // engine-side torque allowed while slipping
         private const float CREEP_RAMP_S = 0.20f;  // seconds to reach full creep cap
         private const float CREEP_THR_THROTTLE = 0.03f;  // tiny pedal is enough to start bite-in
         private float _creepBlend = 0f;                    // 0..1 ramp for bite-in
-
 
         // add near the other tunables
         private const float COUPLED_CAP_NM = 8000f;      // engine-side cap when rigid-coupled
@@ -136,7 +126,6 @@ namespace Vehicle
         private float _idleAssistBlend = 0f;             // 0..1
         private const float LAUNCH_SLIP_SPEED = 1.0f; // m/s (~18 km/h) - slip until roughly here
 
-
         // Limiter shaping
         private const float LIMITER_BAND_RPM = 350f;
         private const float LIMITER_NEG_TORQUE_NM = 140f;
@@ -145,24 +134,18 @@ namespace Vehicle
 
         // Neutral/free-rev feel
         private const float NEUTRAL_UP_MULT = 1.15f;
-        private const float NEUTRAL_DOWN_MULT = 2.5f;
+        private const float NEUTRAL_DOWN_MULT = 1.5f;
         private const float NEUTRAL_PULLDOWN_RPM_PER_S = 3000f;
-
         private const float ANTI_HANG_DELTA_RPM = 100f;      // how far above target before we intervene
         private const float LIFT_DECEL_RPM_PER_S = 60000f;    // extra fall rate on big surplus
-
         private const float GEAR_LOCK_MARGIN_RPM = 100f;          // small headroom to avoid jitter
-        private const float CLOSED_THROTTLE_DECEL_RPM_PER_S = 40000f; // how fast we yank it down on lift
-
         private const float POWER_TAPER_START_RPM = 7000f; // where torque starts falling fast
         private const float POWER_TAPER_END_OFFSET = 100f; // taper ends ~this below limiter
 
         // --- Hard cut limiter ---
         private const float HARD_CUT_RPM = 7400f;
-        private const float HARD_CUT_HYSTERESIS = 150f;    // release around 7250
         private const float HARD_CUT_NEG_TORQUE_NM = 500f; // extra negative torque to pull down fast
         private bool _hardCutActive = false;
-        private const float HARD_CUT_COAST_MULT = 4f; // 2–4 is sane
 
         // Hard cut behaviour
         private const float HARD_CUT_PULSE_S = 0.10f;          // 100 ms cut pulse
@@ -181,25 +164,28 @@ namespace Vehicle
         private const float EB_FIRST_SCALE = 0.60f; // 1st gear EB strength
         private const float EB_AXLE_MAX_NM = 1800f; // per-axle cap for EB (tune)
 
-
         private float _spawnTime;
         private float _revGateTimer = 0f;
         private bool _revGateArmed = false;
 
-        // --- Start-in-Neutral ---
-        private const bool START_IN_NEUTRAL = true;  // set false to go back to current behavior
-        private const float START_NEUTRAL_HOLD_S = 0.60f; // how long we keep it in Neutral after spawn
+        private const bool START_IN_NEUTRAL = true; 
+        private const float START_NEUTRAL_HOLD_S = 0.60f;
 
+        // --- Engine Start/Stop (toggle on button A) ---
+        [SerializeField] private float starterDuration = 0.95f;   // seconds the starter spins
+        [SerializeField] private float starterTargetRPM = 500f;   
+        [SerializeField] private float startStopCooldown = 0.35f; // debounce
+        public event System.Action OnEngineStarted;
 
+        private bool _engineRunning = false;     // current engine state
+        private bool _starterActive = false;    // true while starter is spinning up
+        private float _starterT = 0f;           // 0..1 progress
+        private float _startStopCD = 0f;        // cooldown timer
+        private bool _queuedStartStop = false;  // latched by input edge
 
-
-        private const float REVERSE_GUARD_SPEED = 2.0f; // m/s: treat as "rolling backwards" above this
-
-
-
+        public void QueueStartStopToggle() => _queuedStartStop = true; 
+        private const float REVERSE_GUARD_SPEED = 2.0f;
         public bool UsingReverseThrottleThisFrame { get; private set; }
-
-
 
         // Post-shift coast assist
         private const float POST_SHIFT_COAST = 0.25f;
@@ -213,7 +199,6 @@ namespace Vehicle
         public string GearLabel => _shift.GearLabel;
         public bool IsInReverse => _shift.IsInReverse;
         public int GearIndex => _shift.GearIndex;
-
         public bool LaunchControlEnabled { get => _shift.LaunchControlEnabled; set => _shift.LaunchControlEnabled = value; }
         public bool LaunchInstantTorque { get => _shift.LaunchInstantTorque; set => _shift.LaunchInstantTorque = value; }
         public void ToggleLaunchControl() => _shift.ToggleLaunchControl();
@@ -227,8 +212,16 @@ namespace Vehicle
             _shift = new ShiftSystem(ctx);
 
             // Seed engine RPM / omega
-            _engineRPM = Mathf.Max(_engineRPM, _ctx.settings.idleRPM);
-            _engOmega = _engineRPM * TWO_PI / 60f;
+            if (_engineRunning)
+            {
+                _engineRPM = Mathf.Max(_engineRPM, _ctx.settings.idleRPM);
+                _engOmega = _engineRPM * TWO_PI / 60f;
+            }
+            else
+            {
+                _engineRPM = 0f;
+                _engOmega = 0f;
+            }
 
             float r = _ctx.RL.radius;
             float wheelRPS = _ctx.rb.velocity.magnitude / (2f * Mathf.PI * r);
@@ -240,8 +233,6 @@ namespace Vehicle
             Instances.Add(this);
 
             _spawnTime = Time.time;
-
-
         }
 
         private float GetWheelRPMFromGround()
@@ -257,10 +248,6 @@ namespace Vehicle
             return Mathf.Clamp01((rpm - soft) / Mathf.Max(1f, LIMITER_BAND_RPM));
         }
 
-        // Add this property to DrivetrainSystem (near other fields)
-
-
-        // Replace MapThrottle01 with this version
         private float MapThrottle01(IInputProvider input)
         {
             // Grace window after spawn: ignore all driving inputs
@@ -299,7 +286,6 @@ namespace Vehicle
             }
 
             // --- Auto & Reverse: arcade reverse (LT becomes throttle) ---
-            // Gate to avoid accidental reverse-throttle from tiny LT bumps
             if (lt > REV_ENGAGE_THR)
             {
                 _revGateTimer += Time.fixedDeltaTime;
@@ -315,8 +301,6 @@ namespace Vehicle
             return UsingReverseThrottleThisFrame ? lt : 0f; // RT is ignored while in Reverse
         }
 
-
-
         // Main physics tick (call from FixedUpdate)
         public void Tick(IInputProvider input, float speedMs, bool burnoutMode)
         {
@@ -327,7 +311,12 @@ namespace Vehicle
             float throttle01 = MapThrottle01(input);
             bool onThrottle = throttle01 > 0.05f;
 
-            // --- Hard-cut pulse latch (allow even off-throttle in 1st so downhill overrun is handled) ---
+            // Consume engine toggle request (from input provider)
+            if (input is IInputProvider ip && ip.RequestEngineToggle)
+                _queuedStartStop = true;
+
+
+            // --- Hard-cut pulse latch ---
             bool overRev = _engineRPM >= HARD_CUT_RPM;
             bool allowPulse = onThrottle || (_shift.GearIndex == 2); // 1st gear downhill case
             if (allowPulse && overRev && _hardCutTimer <= 0f) _hardCutTimer = HARD_CUT_PULSE_S;
@@ -341,7 +330,7 @@ namespace Vehicle
             bool isShifting = _shift.IsShifting;
             float clutch = _shift.Clutch;
             int gearIndex = _shift.GearIndex;
-            bool inFirst = (gearIndex == 2); // you already have this earlier; keep a single definition
+            bool inFirst = (gearIndex == 2);
 
             float ratio = _shift.GetCurrentRatio();
             float ratioAbs = Mathf.Abs(ratio * _ctx.settings.finalDrive);
@@ -358,13 +347,11 @@ namespace Vehicle
             // True when car is rolling opposite to selected gear at meaningful speed
             bool reverseMotion = (gearDir * motionDir) < 0 && Mathf.Abs(longSpeedSigned) > REVERSE_GUARD_SPEED;
 
-
             // Dynamic freewheel speed ≈ a bit above "mechanical speed at idle" in 1st
             float wheelCirc = 2f * Mathf.PI * _ctx.RL.radius;
             float idleMechSpeedMs = (_ctx.settings.idleRPM / 60f) / Mathf.Max(ratioAbs, 1e-4f) * wheelCirc;
             // clamp between walking speed and jog
             float FREEWHEEL_SPEED = Mathf.Clamp(idleMechSpeedMs * 1.25f, 1.0f, 5.0f);
-
 
             bool manualMode = !_ctx.settings.automatic;
 
@@ -419,8 +406,69 @@ namespace Vehicle
 
                 vehSpeedKmh = _ctx.rb.velocity.magnitude * 3.6f
             };
-            // --------------------
+            // ===== Engine Start/Stop state machine =====
+            _startStopCD = Mathf.Max(0f, _startStopCD - Time.fixedDeltaTime);
 
+            // Edge-triggered toggle
+            if (_queuedStartStop && _startStopCD <= 0f)
+            {
+                _queuedStartStop = false;
+                _startStopCD = startStopCooldown;
+
+                if (_starterActive)
+                {
+                    _starterActive = false;
+                    _engineRunning = false;
+                }
+                else if (_engineRunning)
+                {
+                    _engineRunning = false;
+                }
+                else
+                {
+                    _ctx.audio?.NotifyEngineStart();
+                    _starterActive = true;          // begin starter spin
+                    _starterT = 0f;
+                    _engineRPM = 0f;
+                }
+            }
+
+            // Starter spin (no drive torque while starting)
+            if (_starterActive)
+            {
+                _starterT = Mathf.Min(1f, _starterT + (Time.fixedDeltaTime / Mathf.Max(0.01f, starterDuration)));
+
+                float target = Mathf.Max(starterTargetRPM, _ctx.settings.idleRPM * 0.80f);
+                _engineRPM = Mathf.Lerp(_engineRPM, target, 0.25f + 0.75f * _starterT);
+
+                _ctx.RL.motorTorque = 0f;
+                _ctx.RR.motorTorque = 0f;
+
+                if (_starterT >= 1f)
+                {
+                    _starterActive = false;
+                    _engineRunning = true;
+                    _engineRPM = Mathf.Max(_engineRPM, _ctx.settings.idleRPM * 1.5f);
+
+
+                }
+
+                dbg.engineRPM = _engineRPM;
+                DebugInfo = dbg;
+                return; // short-circuit this physics frame
+            }
+
+            // Engine OFF → hold RPM at 0 and block all drive torque
+            if (!_engineRunning)
+            {
+                _engineRPM = Mathf.MoveTowards(_engineRPM, 0f, 6000f * Time.fixedDeltaTime);
+                _ctx.RL.motorTorque = 0f;
+                _ctx.RR.motorTorque = 0f;
+
+                dbg.engineRPM = _engineRPM;
+                DebugInfo = dbg;
+                return;
+            }
 
             // ------------------------
             // Burnout special case
@@ -447,14 +495,14 @@ namespace Vehicle
                 _ctx.RL.brakeTorque = 0f; _ctx.RR.brakeTorque = 0f;
                 return;
             }
-            // --- Start-in-Neutral masking (spawn safety) ---
-            // place this right after the burnout block and BEFORE you branch into neutral/coupled paths
+
+            // --- Start-in-Neutral masking ---
             if (START_IN_NEUTRAL)
             {
                 float sinceSpawn = Time.time - _spawnTime;
                 if (sinceSpawn < START_NEUTRAL_HOLD_S)
                 {
-                    // Nudge visible gear toward Neutral (0=R, 1=N, 2=1st in your setup)
+                    // Nudge visible gear toward Neutral
                     if (_shift.GearIndex < 1) _shift.RequestShiftUp();
                     else if (_shift.GearIndex > 1) _shift.RequestShiftDown();
 
@@ -484,13 +532,9 @@ namespace Vehicle
                 }
             }
 
-
-
             // Neutral-like detection
             bool inGear = !Mathf.Approximately(ratio, 0f);
             bool lowSpeedCoast = (!pedalDown && speedMs < FREEWHEEL_SPEED);
-
-
             bool physicallyCoupled =
                 inGear &&
                 (clutch >= RIGID_COUPLE_THR) &&
@@ -500,10 +544,9 @@ namespace Vehicle
                 !reverseMotion; 
             bool flywheelBlend = ((Time.time - _shift.LastShiftTime) < FLYWHEEL_BLEND) && !lowSpeedCoast;
             bool runTwoMass = physicallyCoupled || flywheelBlend;
-
             bool wantFreewheel =
-    inFirst && (ratio > 0f) && !pedalDown && !input.Handbrake &&
-    (speedMs < FREEWHEEL_SPEED) && (wheelRPM > STOP_WHEEL_RPM_EPS);
+                inFirst && (ratio > 0f) && !pedalDown && !input.Handbrake &&
+                (speedMs < FREEWHEEL_SPEED) && (wheelRPM > STOP_WHEEL_RPM_EPS);
 
             if (wantFreewheel)
             {
@@ -512,7 +555,6 @@ namespace Vehicle
                 flywheelBlend = false;
                 runTwoMass = false;
             }
-
             bool neutralLike = !inGear || clutch < 0.2f || gearIndex == 1;
 
             // ------------------------
@@ -536,7 +578,7 @@ namespace Vehicle
                 _ctx.RR.motorTorque = 0f;
 
                 // Gentle coast during upshift if lifted
-                return;
+                //return;
             }
 
             // ------------------------
@@ -566,10 +608,10 @@ namespace Vehicle
             // Only cap the control target during hard cut when NOT mechanically coupled
 
             bool rearmedPosTorque =
-    physicallyCoupled &&
-    (Time.time - _shift.LastShiftTime) >= POS_TORQUE_REARM &&   // e.g. 0.12 s
-    throttle01 >= POS_TORQUE_THR &&                             // e.g. 0.25 pedal
-    !input.Handbrake;
+                physicallyCoupled &&
+                (Time.time - _shift.LastShiftTime) >= POS_TORQUE_REARM &&   
+                throttle01 >= POS_TORQUE_THR &&                            
+                !input.Handbrake;
 
             if (rearmedPosTorque)
             {
@@ -608,8 +650,6 @@ namespace Vehicle
                                                 Time.fixedDeltaTime / Mathf.Max(0.0001f, CREEP_RAMP_S));
                 float creepCap = CREEP_MAX_CAP_NM * _creepBlend;
 
-
-
                 // capture before any change so omegaDot is always well-defined
                 float prevOmega = _engOmega;
 
@@ -625,14 +665,10 @@ namespace Vehicle
                 }
 
                 // Update RPM
-
-
                 _engineRPM = Mathf.Clamp(_engOmega * 60f / TWO_PI, _ctx.settings.idleRPM, _ctx.settings.revLimiterRPM + 200f);
 
-                // Engine request & drag
-                // --- Engine request & drag (leave as you have) ---
+                // --- Engine request & drag ---
                 float T_req = 0f;
-
 
                 // --- Zero-throttle idle assist in 1st to overcome static friction ---
                 bool permitIdleCreep =
@@ -662,8 +698,6 @@ namespace Vehicle
                 float I = Mathf.Max(0.0001f, _ctx.settings.engineInertia);
                 prevOmega = _engOmega;
 
-
-
                 if (pedalDown && !cutWindowActive && !liftCutActive)
                 {
                     T_req = _ctx.settings.torqueCurve.Evaluate(_engineRPM) * throttle01 * _ctx.settings.torqueMultiplier;
@@ -674,9 +708,6 @@ namespace Vehicle
                     if (_engineRPM >= _ctx.settings.revLimiterRPM && throttle01 > 0.1f) T_req = 0f;
                     if (limiterActive) T_req -= LIMITER_NEG_TORQUE_NM * limiterT * (manualMode ? 1f : 0.5f);
                 }
-
-
-
 
                 float T_engineBrake_eng = 0f;
                 if (physicallyCoupled && !pedalDown && !input.Handbrake)
@@ -725,14 +756,8 @@ namespace Vehicle
                     dbg.engineBrakeWheelNm = dbg.T_engineBrake_axle;
                 }
 
-
-
-
                 if (_hardCutActive) { T_req = 0f; T_drag += HARD_CUT_NEG_TORQUE_NM; }
                 if (limiterActive) { T_drag *= (1f + LIMITER_EXTRA_DRAG_MULT * limiterT); }
-
-                // >>> NEW: inject engine-brake as engine-side negative torque when coupled & off-throttle
-
 
                 // Inertia torque & gearbox reaction
 
@@ -757,8 +782,8 @@ namespace Vehicle
                 if (reverseMotion && !pedalDown)
                 {
                     float axleCandidate = T_toGear_engineSide * ratio * _ctx.settings.finalDrive * _ctx.settings.drivetrainEfficiency;
-                    if (Mathf.Sign(axleCandidate) == motionDir) // would help the current roll direction
-                        T_toGear_engineSide = 0f;               // kill it
+                    if (Mathf.Sign(axleCandidate) == motionDir) 
+                        T_toGear_engineSide = 0f;              
                 }
 
                 // soften sign-chatter near 0 when lifted
@@ -767,7 +792,7 @@ namespace Vehicle
 
                 if (blockPosOnLift && targetClutchNm > 0f)
                 {
-                    const float POS_HYS = 25f; // small hysteresis band (tune 10–50 Nm)
+                    const float POS_HYS = 25f; // small hysteresis band
                     targetClutchNm = Mathf.Max(0f, targetClutchNm - POS_HYS);
                 }
 
@@ -776,11 +801,8 @@ namespace Vehicle
                 T_toGear_engineSide = Mathf.MoveTowards(_TclutchPrev, targetClutchNm, maxStep);
                 _TclutchPrev = T_toGear_engineSide;
 
-
                 // Axle reaction
                 // Gate torque transmission to the axle – neutral must not transmit
-
-
                 // No reverse coast at (near) standstill: hold the car instead of integrating to -∞
                 if (almostStopped && inGear && !pedalDown)
                 {
@@ -789,15 +811,11 @@ namespace Vehicle
                     if (ratio > 0f && T_toGear_engineSide < 0f) T_toGear_engineSide = 0f;
                     if (ratio < 0f && T_toGear_engineSide > 0f) T_toGear_engineSide = 0f; // safety for reverse gear
                 }
-
-
                 bool allowTransmit = inGear && (ratioAbs > 1e-4f) && (clutch >= 0.75f);
 
                 // During creep: allow *positive* (forward) torque to flow even if clutch < 0.95
                 if (!allowTransmit && _idleAssistBlend > 0.001f && T_toGear_engineSide > 0f && ratio > 0f)
                     allowTransmit = true;
-
-
 
                 // Kill reverse coast at near-standstill (prevents integrating to -∞)
                 if (almostStopped && inGear && !pedalDown)
@@ -805,7 +823,6 @@ namespace Vehicle
                     if (ratio > 0f && T_toGear_engineSide < 0f) T_toGear_engineSide = 0f; // forward gear, no negative
                     if (ratio < 0f && T_toGear_engineSide > 0f) T_toGear_engineSide = 0f; // reverse gear, no positive
                 }
-
                 float axleTorque = 0f;
                 if (allowTransmit)
                 {
@@ -815,13 +832,9 @@ namespace Vehicle
                     _ctx.RR.motorTorque += perWheel;
                 }
 
-
                 // ---- debug ----
                 dbg.axleTorque = axleTorque;
                 dbg.perWheelMotorNm = 0.5f * (_ctx.RL.motorTorque + _ctx.RR.motorTorque);
-
-
-
                 dbg.T_req = T_req;
                 dbg.T_drag = T_drag;
                 dbg.inertiaNm = Tinertia;
@@ -830,9 +843,7 @@ namespace Vehicle
                 dbg.perWheelMotorNm = 0.5f * (_ctx.RL.motorTorque + _ctx.RR.motorTorque);
                 dbg.perWheelBrakeNm = 0.5f * (_ctx.RL.brakeTorque + _ctx.RR.brakeTorque);
 
-
-
-
+                /*
                 // Kinematic sanity check
                 if (physicallyCoupled && ratioAbs > 0.0001f)
                 {
@@ -841,8 +852,11 @@ namespace Vehicle
                     float kmh_mech = speedMs_mech * 3.6f;
                     float kmh_body = _ctx.rb.velocity.magnitude * 3.6f;
                     if (!float.IsInfinity(kmh_mech) && Mathf.Abs(kmh_mech - kmh_body) > 1.0f)
+                    {
                         Debug.LogWarning($"[Drive] Kinematic mismatch while coupled: engine-speed {kmh_mech:F1} km/h vs vehicle {kmh_body:F1} km/h (gear {gearIndex})");
+                    }
                 }
+                */
 
                 if (physicallyCoupled && ratioAbs > 0.0001f)
                 {
@@ -855,10 +869,6 @@ namespace Vehicle
                 return;
 
             }
-
-
-
-
 
             // ------------------------
             // Non-coupled path (neutral, clutch open, etc.)
@@ -898,8 +908,6 @@ namespace Vehicle
                     _engineRPM = Mathf.MoveTowards(_engineRPM, mechRPMNow - band, syncRate * Time.fixedDeltaTime);
                 _engOmega = Mathf.Max(0f, _engineRPM * TWO_PI / 60f);
             }
-
-
 
             // Anti-hang extra fall on lift
             if (!neutralLike)
@@ -987,8 +995,6 @@ namespace Vehicle
                 _ctx.RR.motorTorque = perWheelTorque;
             }
 
-
-
             // Guard the hard-cut cap only when not mechanically coupled
             if (_hardCutActive && !physicallyCoupled && _engineRPM > HARD_CUT_RPM - HARD_CUT_RPM_CAP_MARGIN)
                 _engineRPM = HARD_CUT_RPM - HARD_CUT_RPM_CAP_MARGIN;
@@ -1000,8 +1006,6 @@ namespace Vehicle
             dbg.perWheelMotorNm = 0.5f * (_ctx.RL.motorTorque + _ctx.RR.motorTorque);
             dbg.perWheelBrakeNm = 0.5f * (_ctx.RL.brakeTorque + _ctx.RR.brakeTorque);
             DebugInfo = dbg;
-
-
         }
 
         private float HighRpmFalloff(float rpm)
@@ -1016,6 +1020,5 @@ namespace Vehicle
             float s = t * t * (3f - 2f * t);
             return 1f - s * s; // 1 → 0 quickly as rpm rises through the taper band
         }
-
     }
 }

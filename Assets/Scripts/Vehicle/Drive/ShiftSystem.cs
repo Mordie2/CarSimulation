@@ -60,7 +60,7 @@ namespace Vehicle
 
         // Gear protection / margins
         private const float EMERGENCY_RPM = 7200f;
-        private const float CRUISE_NO_SHIFT_THR = 0.08f;
+        private const float CRUISE_NO_SHIFT_THR = 0.2f;
         private const float DOWNSHIFT_DEMAND_THR = 0.35f;
 
         // Launch control
@@ -83,9 +83,17 @@ namespace Vehicle
         private const float LAUNCH_COOLDOWN = 1.0f;      // s
         private const float LAUNCH_DISABLE_SPEED = 10f / 3.6f;
 
+
+        // Auto-neutral condition
+        private const float AUTO_NEUTRAL_SPEED_MS = 10f / 3.6f; // 10 km/h
+        private const float AUTO_NEUTRAL_RPM = 1150f;
+
+        // Use a very small band for direction latch / instant R/1st selection
+        private const float DIRECTION_STOP_MS = 0.05f; // ≈ 0.18 km/h
+
+
         // Post-shift fade from 1st
         private const float POST_SHIFT_FADE_12 = 0.22f;
-
 
         // Rev-protect clutch bleed (1st gear only)
         private const float REV_PROTECT_CLUTCH = 0.35f;   // target clutch while protecting
@@ -132,6 +140,7 @@ namespace Vehicle
         public ShiftSystem(VehicleContext ctx)
         {
             _ctx = ctx;
+            _gearIndex = _ctx.settings.automatic ? 1 /*N*/ : 2 /*1st*/;
             _dir = (_gearIndex == 0) ? DriveDir.Reverse : DriveDir.Forward;
 
             // Ensure sane ratios
@@ -184,31 +193,65 @@ namespace Vehicle
             if (input.RequestShiftUp) ShiftUp();
             if (input.RequestShiftDown) ShiftDown();
 
-            // Auto direction latch when stopped
-            if (_ctx.settings.automatic)
+            // Auto-neutral + intent handling (automatic only)
+            if (_ctx.settings.automatic && !_isShifting)
             {
-                if (stopped)
-                {
-                    if (input.Brake > PRESS_INTENT) _dir = DriveDir.Reverse;
-                    if (input.Throttle > PRESS_INTENT) _dir = DriveDir.Forward;
+                // Neutral when: speed < 10 km/h && RPM <= 1150 && no pedal intent
+                bool wantAutoNeutral =
+                    (speedMs <= AUTO_NEUTRAL_SPEED_MS) &&
+                    (engineRPM <= AUTO_NEUTRAL_RPM) &&
+                    (input.Throttle <= PRESS_INTENT && input.Brake <= PRESS_INTENT);
 
-                    // hysteresis
-                    if (_dir == DriveDir.Reverse && input.Brake < RELEASE_INTENT && input.Throttle > PRESS_INTENT) _dir = DriveDir.Forward;
-                    if (_dir == DriveDir.Forward && input.Throttle < RELEASE_INTENT && input.Brake > PRESS_INTENT) _dir = DriveDir.Reverse;
+                if (wantAutoNeutral)
+                {
+                    if (_gearIndex != 1) { SetNeutralInstant(); return; }
+                }
+                else
+                {
+                    // --- Re-engage from NEUTRAL on intent even while rolling ---
+                    if (_gearIndex == 1)
+                    {
+                        // Forward intent (allow up to 10 km/h so you can "catch" the roll)
+                        if (input.Throttle > PRESS_INTENT)
+                        {
+                            _dir = DriveDir.Forward;
+                            if (_lcInstant && speedMs < LAUNCH_EXIT_SPEED) { SetFirstInstant(); return; }
+                            StartShift(2); // into 1st
+                            return;
+                        }
+
+                        // Reverse intent only when truly stopped (safety)
+                        if (input.Brake > PRESS_INTENT && speedMs <= DIRECTION_STOP_MS)
+                        {
+                            _dir = DriveDir.Reverse;
+                            if (_gearIndex != 0) { SetReverseInstant(); return; }
+                        }
+                    }
                 }
 
-                // Apply latched direction when stopped
-                if (stopped)
+                // Direction latch only when *truly* stopped to avoid bouncing at low speeds
+                bool atTinyStop = (speedMs <= DIRECTION_STOP_MS);
+                if (atTinyStop && _gearIndex != 1)
                 {
-                    if (_dir == DriveDir.Reverse && _gearIndex != 0) { SetReverseInstant(); return; }
-                    if (_dir == DriveDir.Forward && _gearIndex < 2)
+                    if (input.Brake > PRESS_INTENT)
                     {
-                        if (_lcInstant) { SetFirstInstant(); return; }
-                        StartShift(2);
-                        return;
+                        _dir = DriveDir.Reverse;
+                        if (_gearIndex != 0) { SetReverseInstant(); return; }
+                    }
+                    else if (input.Throttle > PRESS_INTENT)
+                    {
+                        _dir = DriveDir.Forward;
+                        if (_gearIndex < 2)
+                        {
+                            if (_lcInstant) { SetFirstInstant(); return; }
+                            StartShift(2);
+                            return;
+                        }
                     }
                 }
             }
+
+
 
             // Emergency upshift
             if (_ctx.settings.automatic && !_isShifting && _gearIndex >= 2 && engineRPM >= EMERGENCY_RPM)
@@ -236,7 +279,7 @@ namespace Vehicle
                     float downOn = _ctx.settings.shiftDownRPM;
 
                     // Upshift: needs demand + sustained high RPM
-                    bool canUpshift = allowAnyShift && (_gearIndex < last) && (throttle01 >= 0.5f);
+                    bool canUpshift = allowAnyShift && (_gearIndex < last) && (throttle01 >= 0.1f);
                     if (canUpshift)
                     {
                         float nextRatioAbs = Mathf.Abs(_ctx.settings.gearRatios[_gearIndex + 1] * _ctx.settings.finalDrive);
@@ -293,7 +336,6 @@ namespace Vehicle
             }
 
             // Shift timing / clutch profile
-            // Shift timing / clutch profile
             if (_isShifting)
             {
                 _shiftTimer += Time.fixedDeltaTime;
@@ -312,7 +354,6 @@ namespace Vehicle
             }
             else
             {
-                // === NEW: first-gear slip control to hold launch RPM ===
                 bool inFirstgear = (_gearIndex == 2);
                 bool wantLaunchSlip =
                     inFirstgear &&
@@ -322,8 +363,6 @@ namespace Vehicle
 
                 if (wantLaunchSlip)
                 {
-                    // Use your minLaunchRPM as the target; if it's lower than 3000, this will still work,
-                    // but you likely want it ~3000 in VehicleSettings.
                     float targetLaunchRPM = Mathf.Max(_ctx.settings.minLaunchRPM, 3000f);
 
                     // Latch: while RPM is above target band, bias the clutch open toward a slip value.
@@ -352,7 +391,6 @@ namespace Vehicle
                     _revProtectLatched = false;
                 }
             }
-
 
             // Launch control state machine (only matters for 1st)
             bool inFirst = (_gearIndex == 2);
@@ -455,7 +493,7 @@ namespace Vehicle
             _shiftTimer = 0f;
             _clutch = 1f;
 
-            _torqueCutUntil = Time.time;      // no torque cut hangover
+            _torqueCutUntil = Time.time;
             _lastShiftTime = Time.time;
             _postShiftFromGear = old;
 
@@ -476,5 +514,20 @@ namespace Vehicle
 
             OnGearChanged?.Invoke(old, 2);
         }
+        public void SetNeutralInstant()
+        {
+            int old = _gearIndex;
+            _gearIndex = 1; // N
+            _isShifting = false;
+            _shiftTimer = 0f;
+            _clutch = 1f;
+
+            _torqueCutUntil = Time.time;   // no lingering cut
+            _lastShiftTime = Time.time;
+            _postShiftFromGear = old;
+
+            OnGearChanged?.Invoke(old, 1);
+        }
+
     }
 }

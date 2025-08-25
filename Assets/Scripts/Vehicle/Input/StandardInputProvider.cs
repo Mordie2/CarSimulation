@@ -3,7 +3,7 @@
 namespace Vehicle
 {
     /// <summary>
-    /// Legacy Input Manager provider that auto-detects trigger layout (combined or separate),
+    /// (Yet to be) Legacy Input Manager provider that auto-detects trigger layout (combined or separate),
     /// supports keyboard fallback, and adds D-Pad Up/Down shifting (axis or button).
     /// </summary>
     public class StandardInputProvider : IInputProvider
@@ -14,18 +14,20 @@ namespace Vehicle
         static readonly string[] AXIS_LT = { "ControllerBrake", "LT", "LeftTrigger", "L2", "TriggerL", "Axis 9", "8th axis", "Axis 4" };
         static readonly string[] AXIS_STEER = { "JoystickHorizontal", "LeftStickX", "Horizontal", "Axis 1" };
         static readonly string[] AXIS_VERT_KB = { "Vertical" };
-
-        // DPAD (vertical) axis names vary by platform/driver
         static readonly string[] AXIS_DPAD_V = { "DPadY", "DPadVertical", "D-Pad Y", "Axis 7", "7th axis", "Axis 6" };
-
-        // Optional: if you mapped D-Pad to buttons in the Input Manager
         static readonly string[] BTN_DPAD_UP = { "DPadUp", "DPAD UP", "D-Pad Up" };
         static readonly string[] BTN_DPAD_DOWN = { "DPadDown", "DPAD DOWN", "D-Pad Down" };
-
         static readonly string[] BTN_HANDBRAKE = { "Handbrake" };
+        static readonly string[] BTN_A = { "A", "ButtonA", "South", "Button South", "ButtonSouth" };
 
         const float DZ = 0.07f;     // stick/trigger deadzone
         const float HAT_THR = 0.5f; // D-Pad axis threshold
+
+        // --- Keyboard throttle/brake smoothing (units per second) ---
+        public float kbRisePerSec = 0.7f;   // how fast 0 -> 1
+        public float kbFallPerSec = 10f;  // how fast 1 -> 0
+        private float _kbThrottleSm = 0f; // smoothed keyboard throttle (0..1)
+        private float _kbBrakeSm = 0f;    // smoothed keyboard brake (0..1)
 
         // Detection cache
         bool _useCombined;
@@ -47,8 +49,9 @@ namespace Vehicle
         private bool _shiftDownPulse;  // latched for one frame
 
         public static bool debugInput = false;
-
         [SerializeField] private bool triggersAreZeroToNegOne = true;
+
+        private bool _enginePulse;
 
         public StandardInputProvider()
         {
@@ -74,7 +77,6 @@ namespace Vehicle
         }
 
         // -------- IInputProvider --------
-
         public float Horizontal
         {
             get
@@ -130,18 +132,34 @@ namespace Vehicle
             // Also latch pulses via button fallback (if you mapped them)
             if (GetButtonDownAny(BTN_DPAD_UP)) _shiftUpPulse = true;
             if (GetButtonDownAny(BTN_DPAD_DOWN)) _shiftDownPulse = true;
+
+            if (GetButtonDownAny(BTN_A) || Input.GetKeyDown(KeyCode.JoystickButton0) || Input.GetKeyDown(KeyCode.V))
+                _enginePulse = true;
+
+            // ---- Keyboard accel/brake smoothing ----
+            // Read keyboard vertical (-1..1), split into throttle/brake targets, deadzone, then ramp.
+            float kbAxis = SafeGetAxisRaw(_axisVertKB);
+            float kbThrottleTgt = Deadzone01(Mathf.Max(0f, kbAxis));   // W/Up
+            float kbBrakeTgt = Deadzone01(Mathf.Max(0f, -kbAxis));     // S/Down
+
+            float dt = Time.deltaTime;
+            _kbThrottleSm = MoveToward01(_kbThrottleSm, kbThrottleTgt, kbRisePerSec, kbFallPerSec, dt);
+            _kbBrakeSm   = MoveToward01(_kbBrakeSm,   kbBrakeTgt,   kbRisePerSec, kbFallPerSec, dt);
         }
+
+        public bool RequestEngineToggle => ConsumePulse(ref _enginePulse);
 
         public float Throttle
         {
             get
             {
                 ReadTriggers(out float rt01, out _);
-                float kb = Mathf.Max(0f, SafeGetAxisRaw(_axisVertKB)); // W/Up
-                float final = Mathf.Clamp01(Mathf.Max(rt01, Deadzone01(kb)));
+
+                // final = max(gamepad trigger, smoothed keyboard)
+                float final = Mathf.Clamp01(Mathf.Max(rt01, _kbThrottleSm));
 
                 if (debugInput)
-                    Debug.Log($"[Throttle] rawRT={_lastRawRT:0.00} mappedRT={rt01:0.00} kb={kb:0.00} -> final={final:0.00}");
+                    Debug.Log($"[Throttle] rawRT={_lastRawRT:0.00} kbSm={_kbThrottleSm:0.00} -> final={final:0.00}");
 
                 return final;
             }
@@ -152,11 +170,12 @@ namespace Vehicle
             get
             {
                 ReadTriggers(out _, out float lt01);
-                float kb = Mathf.Max(0f, -SafeGetAxisRaw(_axisVertKB)); // S/Down
-                float final = Mathf.Clamp01(Mathf.Max(lt01, Deadzone01(kb)));
+
+                // final = max(gamepad trigger, smoothed keyboard)
+                float final = Mathf.Clamp01(Mathf.Max(lt01, _kbBrakeSm));
 
                 if (debugInput)
-                    Debug.Log($"[Brake] rawLT={_lastRawLT:0.00} mappedLT={lt01:0.00} kb={kb:0.00} -> final={final:0.00}");
+                    Debug.Log($"[Brake] rawLT={_lastRawLT:0.00} kbSm={_kbBrakeSm:0.00} -> final={final:0.00}");
 
                 return final;
             }
@@ -209,6 +228,13 @@ namespace Vehicle
 
         static float DeadzoneSigned(float x) =>
             Mathf.Abs(x) < DZ ? 0f : x;
+
+        static float MoveToward01(float current, float target, float risePerSec, float fallPerSec, float dt)
+        {
+            if (target > current) return Mathf.Min(target, current + risePerSec * dt);
+            if (target < current) return Mathf.Max(target, current - fallPerSec * dt);
+            return current;
+        }
 
         static bool TryPickAxis(string[] candidates, out string chosen)
         {

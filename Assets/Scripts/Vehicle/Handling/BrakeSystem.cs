@@ -1,5 +1,5 @@
 ﻿// =============================================
-// File: Scripts/Vehicle/Brakes/BrakeSystem.cs
+// File: Scripts/Vehicle/Handling/BrakeSystem.cs
 // Role: Service brake + handbrake + ABS modulation
 // =============================================
 using UnityEngine;
@@ -15,9 +15,8 @@ namespace Vehicle
         {
             _ctx = ctx;
             _absEnabled = _ctx.settings.absEnabledDefault;
-            _ctx.host.gameObject.AddComponent<BrakeSystemMarker>(); // tag for coast brake stacking logic
+            _ctx.host.gameObject.AddComponent<BrakeSystemMarker>();
         }
-
         public void SetAbsEnabled(bool enabled) => _absEnabled = enabled;
 
         public void TickBase(IInputProvider input, bool inReverse, bool isBurnout)
@@ -31,9 +30,7 @@ namespace Vehicle
                 _ctx.FR.brakeTorque = frontLock;
                 return;
             }
-
             bool manualMode = !_ctx.settings.automatic;
-
             // Manual: brake pedal always brakes (even in reverse).
             // Auto:   forward uses Brake; reverse uses Brake-as-throttle, so service brake is 0 here.
             float serviceBrake01;
@@ -64,14 +61,11 @@ namespace Vehicle
                 _ctx.RR.brakeTorque += hb;
             }
         }
-
-
         public void TickABS(bool isBurnout)
         {
             if (!_absEnabled) return;
             if (isBurnout) return;
             if (TotalBrakeDemand01() <= 0.01f) return;
-
             ApplyABSOnWheel(_ctx.FL);
             ApplyABSOnWheel(_ctx.FR);
             ApplyABSOnWheel(_ctx.RL);
@@ -95,7 +89,6 @@ namespace Vehicle
             float gp = Mathf.Abs(Input.GetAxis("ControllerBrake"));
             return Mathf.Max(k, gp);
         }
-
 
         private void ApplyABSOnWheel(WheelCollider wc)
         {

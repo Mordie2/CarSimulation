@@ -17,7 +17,7 @@ namespace Vehicle
         public Transform frontLWheelTransform, frontRWheelTransform, rearLWheelTransform, rearRWheelTransform;
 
         [Header("Settings")]
-        public VehicleSettings settings; // ScriptableObject for tunables (optional, but recommended)
+        public VehicleSettings settings; // ScriptableObject for tunables 
 
         // Runtime state exposed for HUD/Debug
         public float speedMs;
@@ -34,34 +34,6 @@ namespace Vehicle
         // Old fields expected by CarEffects:
         public bool handbrakeInput => _input?.Handbrake ?? false;
 
-        // Simple smoke trigger: slip or handbrake => true
-        public bool playPauseSmoke => ComputeSmoke_Compat();
-
-        public bool RearLeftSlip => GetSlip(_ctx.RL);
-        public bool RearRightSlip => GetSlip(_ctx.RR);
-
-        private bool GetSlip(WheelCollider wc)
-        {
-            if (wc.GetGroundHit(out var hit))
-                return Mathf.Abs(hit.sidewaysSlip) > _ctx.settings.smokeSlipThreshold
-                    || Mathf.Abs(hit.forwardSlip) > _ctx.settings.smokeSlipThreshold;
-            return false;
-        }
-
-        private bool ComputeSmoke_Compat()
-        {
-            float th = _ctx.settings.smokeSlipThreshold;
-            bool smoking = false;
-
-            if (_ctx.RL.GetGroundHit(out var hl))
-                smoking |= Mathf.Abs(hl.sidewaysSlip) > th || Mathf.Abs(hl.forwardSlip) > th;
-
-            if (_ctx.RR.GetGroundHit(out var hr))
-                smoking |= Mathf.Abs(hr.sidewaysSlip) > th || Mathf.Abs(hr.forwardSlip) > th;
-
-            return smoking || handbrakeInput;
-        }
-
         // Systems
         private Rigidbody _rb;
         private IInputProvider _input;
@@ -71,6 +43,7 @@ namespace Vehicle
         private SuspensionAeroSystem _suspensionAero;
         private WheelPoseUpdater _wheelPose;
         private CarAudioSystem _audio;
+        private CarEffects _effects;
 
         // Cached context passed into systems
         private VehicleContext _ctx;
@@ -104,9 +77,11 @@ namespace Vehicle
                 frontLWheelTransform, frontRWheelTransform, rearLWheelTransform, rearRWheelTransform);
 
             _audio = new CarAudioSystem(_ctx);
+            _effects = GetComponent<CarEffects>();
+            _ctx.audio = _audio;
             _drivetrain.OnGearChanged += _audio.OnGearChanged;
 
-            // Optional friction and suspension setup
+            // friction and suspension setup
             WheelTuning.ApplyDefaultFriction(frontLWheelCollider, true);
             WheelTuning.ApplyDefaultFriction(frontRWheelCollider, true);
             WheelTuning.ApplyDefaultFriction(rearLWheelCollider, false);
@@ -119,7 +94,7 @@ namespace Vehicle
             _input.Update();
             _audio?.OnUpdate();
 
-            // Toggle ABS (sample)
+            // Toggle ABS
             if (Input.GetKeyDown(_ctx.settings.absToggleKey))
             {
                 absEnabled = !absEnabled;
@@ -137,7 +112,7 @@ namespace Vehicle
             // 2) Compute burnout once (gas + brake + near stop)
             bool burnout = (_input.Throttle > 0.9f && _input.Brake > 0.9f && speedMs < 3f);
 
-            // 3) NEW: Shifting + Powertrain in one go (decide gear BEFORE brakes)
+            // 3) Shifting + Powertrain in one go (decide gear BEFORE brakes)
             _drivetrain.Tick(_input, speedMs, burnout);
 
             // 4) Brakes / ABS with correct reverse flag & burnout
@@ -148,6 +123,7 @@ namespace Vehicle
             _suspensionAero.Tick();
 
             // 6) Visuals & audio
+            _effects?.OnFixedUpdate();
             _wheelPose.UpdateAll();
             _audio?.OnFixedUpdate(_drivetrain.EngineRPM, Mathf.Abs(_input.Throttle));
 

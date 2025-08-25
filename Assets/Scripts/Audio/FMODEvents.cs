@@ -10,6 +10,14 @@ public class FMODEvents : MonoBehaviour
     [field: SerializeField] public EventReference Engine { get; private set; }
     [field: SerializeField] public EventReference Shift { get; private set; }
     [field: SerializeField] public EventReference Wind { get; private set; }
+    [field: SerializeField] public EventReference Skid { get; private set; }
+    [field: SerializeField] public EventReference WheelSpin { get; private set; }
+    [field: SerializeField] public EventReference EngineStart { get; private set; }
+    [field: SerializeField] public EventReference Brake { get; private set; }
+    [field: SerializeField] public EventReference Pops { get; private set; }
+    [field: SerializeField] public EventReference Handbrake { get; private set; }
+
+
 
     [field: Header("Music")]
     public static FMODEvents instance { get; private set; }
